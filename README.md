@@ -6,18 +6,19 @@ Industrial control network demo using Analog Devices 10BASE-T1L Single Pair Ethe
 
 | Board | Description | IP Address |
 |-------|------------|------------|
-| Raspberry Pi 4 + [EVAL-T1LPSE](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/eval-t1lpse.html) | Main controller — runs the GUI, acts as TCP client and SPoE PSE | 192.168.98.1 |
-| [AD-APARD32690-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-apard32690-sl.html) #1 + [AD-APARDPFWD-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-apardpfwd-sl.html) | APARD #1 — MAX32690 MCU with ADIN2111 (dual-port T1L MAC-PHY) | 192.168.98.50 |
+| Raspberry Pi 4 + [AD-RPI-T1LPSE-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-rpi-t1lpse-sl.html) | Main controller — runs the GUI, acts as TCP client and SPoE PSE | 192.168.98.1 |
+| [AD-APARD32690-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-apard32690-sl.html) #1 + [AD-APARDPFWD-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-apardpfw-sl.html) | APARD #1 — MAX32690 MCU with ADIN2111 (dual-port T1L MAC-PHY) | 192.168.98.50 |
 | [AD-APARD32690-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-apard32690-sl.html) #2 + [AD-APARDSPOE-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-apardspoe-sl.html) | APARD #2 — MAX32690 MCU with ADIN1110 (single-port T1L MAC-PHY) | 192.168.98.60 |
-| Raspberry Pi 4 + [EVAL-CN0575-RPIZ](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/eval-cn0575-rpiz.html) | CN0575 — ADT75 temperature sensor over T1L | 192.168.10.2 |
-| [AD-T1LUSB-EBZ](https://wiki.analog.com/resources/eval/user-guides/ad-t1lusb-ebz) | USB-to-T1L adapter — plugged into a USB port on the main RPi | — |
-| [EVAL-AD-SWIOT1L-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/eval-ad-swiot1l-sl.html) | SWIOT1L — MAX14906 digital output + AD74413R analog I/O (independently powered) | 192.168.97.40 |
+| Raspberry Pi 4 + [EVAL-CN0575-RPIZ](https://analogdevicesinc.github.io/documentation/solutions/reference-designs/eval-cn0575-rpiz/index.html) | CN0575 — ADT75 temperature sensor over T1L | 192.168.10.2 |
+| [AD-T1LUSB-EBZ](https://analogdevicesinc.github.io/documentation/solutions/reference-designs/ad-apard32690-sl/ad-t1lusb-ebz/index.html) | USB-to-T1L adapter — plugged into a USB port on the main RPi | — |
+| [EVAL-AD-SWIOT1L-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-swiot1l-sl.html) | SWIOT1L — MAX14906 digital output + AD74413R analog I/O (independently powered) | 192.168.97.40 |
 
 ### Additional Components
 
 - 2x LED + 330 ohm resistor (wired to P2.7 / GPIO_2 on each APARD board header P7)
 - DC fan connected to SWIOT1L MAX14906 channel 0 (digital output for PWM)
-- Single Pair Ethernet cables (T1L) between all boards
+- Single Pair Ethernet cables (T1L) between Main RPi, APARD #1, APARD #2, and CN0575
+- SWIOT1L connects to the main RPi via the AD-T1LUSB-EBZ USB-to-T1L adapter (not directly through the T1LPSE)
 - USB cables for flashing APARD boards via DAPLINK
 
 ## Software and Firmware
@@ -72,21 +73,6 @@ pyadi-iio
                             └──────────────────┘
 ```
 
-## Repository Structure
-
-```
-industrial-demo/
-├── RPI_T1LPSE/
-│   └── main_app.py              # Tkinter GUI — runs on main RPi
-├── RPI_CN0575/
-│   └── cn0575_state_machine.py  # TCP server — runs on CN0575 RPi
-├── firmware_changes/            # C firmware modifications for APARD boards
-│   ├── apard_communication_example.c
-│   ├── common_data_apard1.c
-│   ├── common_data_apard2.c
-│   └── common_data.h
-└── README.md
-```
 
 ## Command Protocol (APARD Boards)
 
@@ -118,13 +104,6 @@ ssh analog@192.168.10.2
 python3 /home/analog/cn0575_state_machine.py
 ```
 
-To run at boot as a systemd service:
-
-```bash
-sudo systemctl enable cn0575-server
-sudo systemctl start cn0575-server
-```
-
 ### 2. APARD Boards — Flash the firmware
 
 Flash `apard_communication_example.c` via DAPLINK using the no-OS build system:
@@ -142,12 +121,3 @@ pip3 install matplotlib pyadi-iio
 python3 RPI_T1LPSE/main_app.py
 ```
 
-## GUI Overview
-
-The control panel has four panels in a 2x2 layout:
-
-- **APARD #1 / #2** (top row) — LED ON/OFF/Status buttons
-- **CN0575** (bottom left) — ADT75 temperature with live graph
-- **SWIOT1L** (bottom right) — Fan duty cycle input with speed graph
-
-All TCP operations run in background threads to keep the GUI responsive. A communication log at the bottom shows all commands and responses.
