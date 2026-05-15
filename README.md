@@ -175,16 +175,28 @@ sudo apt-get install -y network-manager
 
 The demo uses multiple network interfaces and subnets. Configure each on the main RPi.
 
-#### T1LPSE Interface (APARD and CN0575 subnet)
+#### T1LPSE Interface (APARD subnet — 192.168.98.x)
 
-The T1LPSE hat creates an Ethernet interface for the 10BASE-T1L network. Assign a static IP:
+The T1LPSE hat creates an Ethernet interface for the 10BASE-T1L network. Assign a static IP for the APARD boards:
 
 ```bash
 sudo nmcli connection add type ethernet con-name t1l-apard \
     ifname <t1l-interface> \
-    ipv4.addresses 192.168.98.1/16 \
+    ipv4.addresses 192.168.98.1/24 \
     ipv4.method manual
 sudo nmcli connection up t1l-apard
+```
+
+#### CN0575 Interface (CN0575 subnet — 192.168.10.x)
+
+The CN0575 RPi is on a separate subnet, reached through a different T1L port on the T1LPSE:
+
+```bash
+sudo nmcli connection add type ethernet con-name t1l-cn0575 \
+    ifname <cn0575-t1l-interface> \
+    ipv4.addresses 192.168.10.1/24 \
+    ipv4.method manual
+sudo nmcli connection up t1l-cn0575
 ```
 
 #### USB-T1L Interface (SWIOT1L subnet)
