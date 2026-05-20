@@ -58,11 +58,8 @@ grep "dtoverlay=rpi-t1lpse-class12" /boot/config.txt
 
 If the overlay is missing, add it:
 
-```bash
-echo "dtoverlay=rpi-t1lpse-class12" | sudo tee -a /boot/config.txt
-sudo reboot
-```
 Make sure it was added under [Pi4] section if you are using a Raspberry Pi 4.
+If using a Raspberry Pi 5, change [cm5] to [Pi5] and put the overlay under that section.
 After reboot, confirm the overlay is loaded:
 
 ```bash
@@ -110,16 +107,29 @@ source ~/.bashrc
 
 #### no-OS
 
-Clone the repository and patch the build files for missing source dependencies:
+Clone the fork with the APARD LED control examples:
 
 ```bash
-git clone --recursive https://github.com/analogdevicesinc/no-OS.git ~/no-OS
+git clone --recursive https://github.com/GanscaTudor/no-OS.git --branch industrial-demo ~/no-OS
 ```
 
-Append the required peripheral driver sources to the project build file:
+This branch contains two projects used in the demo:
+- `projects/apardpfwd` — `apard_led_control_example` for APARD #1 (ADIN2111 / PFWD shield)
+- `projects/apardspoe` — `apardspoe_led_control_example` for APARD #2 (ADIN1110 / SPOE shield)
+
+Append the required peripheral driver sources to each project's build file:
 
 ```bash
 cat >> ~/no-OS/projects/apardpfwd/src.mk << 'EOF'
+
+SRCS += $(MAXIM_LIBRARIES)/PeriphDrivers/Source/SYS/mxc_delay.c \
+        $(MAXIM_LIBRARIES)/PeriphDrivers/Source/SYS/mxc_lock.c
+
+INCS += $(MAXIM_LIBRARIES)/PeriphDrivers/Include/MAX32690/mxc_delay.h \
+        $(MAXIM_LIBRARIES)/PeriphDrivers/Include/MAX32690/mxc_lock.h
+EOF
+
+cat >> ~/no-OS/projects/apardspoe/src.mk << 'EOF'
 
 SRCS += $(MAXIM_LIBRARIES)/PeriphDrivers/Source/SYS/mxc_delay.c \
         $(MAXIM_LIBRARIES)/PeriphDrivers/Source/SYS/mxc_lock.c
@@ -224,61 +234,22 @@ ping -c 3 192.168.97.40   # SWIOT1L
 
 ### Phase 4 — Build Firmware
 
-#### APARD #1 (ADIN2111, IP 192.168.98.50)
+Build both APARD projects. Each project's Makefile defaults to `apard_communication_example`, so override with the `EXAMPLE=` flag to build the LED control examples instead.
+
+#### APARD #1 — `apard_led_control_example` (ADIN2111, IP 192.168.98.50)
 
 ```bash
 cd ~/no-OS/projects/apardpfwd
-
-sed -i 's/^NO_OS_IP=.*/NO_OS_IP=192.168.98.50/' Makefile
-sed -i 's/^NO_OS_NETMASK=.*/NO_OS_NETMASK=255.255.0.0/' Makefile
-sed -i 's/^NO_OS_GATEWAY=.*/NO_OS_GATEWAY=0.0.0.0/' Makefile
-
-make clean && make RELEASE=y -j
+make clean && make RELEASE=y -j EXAMPLE=apard_led_control_example
 cp build/apardpfwd.elf /home/analog/apard1.elf
 ```
 
-The default `common_data.c` configuration is used for APARD #1:
-
-| Parameter | Value |
-|-----------|-------|
-| `adin1110_rst_gpio_ip.port` | 2 |
-| `adin1110_rst_gpio_ip.number` | 31 |
-| `adin1110_spi_ip.device_id` | 0 |
-| `adin1110_ip.chip_type` | ADIN2111 |
-
-#### APARD #2 (ADIN1110, IP 192.168.98.60)
-
-Modify `src/common/common_data.c` for the second board's hardware connections, then build:
+#### APARD #2 — `apardspoe_led_control_example` (ADIN1110, IP 192.168.98.60)
 
 ```bash
-cd ~/no-OS/projects/apardpfwd
-
-COMMON_DATA="src/common/common_data.c"
-sed -i 's/\.port = 2,/\.port = 1,/' $COMMON_DATA
-sed -i 's/\.number = 31,/\.number = 5,/' $COMMON_DATA
-sed -i 's/\.device_id = 0,/\.device_id = 4,/' $COMMON_DATA
-sed -i 's/\.chip_type = ADIN2111,/\.chip_type = ADIN1110,/' $COMMON_DATA
-
-sed -i 's/^NO_OS_IP=.*/NO_OS_IP=192.168.98.60/' Makefile
-
-make clean && make RELEASE=y -j
-cp build/apardpfwd.elf /home/analog/apard2.elf
-```
-
-| Parameter | Value |
-|-----------|-------|
-| `adin1110_rst_gpio_ip.port` | 1 |
-| `adin1110_rst_gpio_ip.number` | 5 |
-| `adin1110_spi_ip.device_id` | 4 |
-| `adin1110_ip.chip_type` | ADIN1110 |
-
-Restore `common_data.c` back to APARD #1 defaults after building:
-
-```bash
-sed -i 's/\.port = 1,/\.port = 2,/' $COMMON_DATA
-sed -i 's/\.number = 5,/\.number = 31,/' $COMMON_DATA
-sed -i 's/\.device_id = 4,/\.device_id = 0,/' $COMMON_DATA
-sed -i 's/\.chip_type = ADIN1110,/\.chip_type = ADIN2111,/' $COMMON_DATA
+cd ~/no-OS/projects/apardspoe
+make clean && make RELEASE=y -j EXAMPLE=apardspoe_led_control_example
+cp build/apardspoe.elf /home/analog/apard2.elf
 ```
 
 #### SWIOT1L Firmware
@@ -360,7 +331,7 @@ Text-based, newline-terminated. One TCP connection per command.
 | `LED_ON\n` | `OK\n` | Set LED GPIO high |
 | `LED_OFF\n` | `OK\n` | Set LED GPIO low |
 | `LED_STATUS\n` | `LED:ON\n` or `LED:OFF\n` | Read current LED state |
-| `READ_TEMP\n` | `TEMP:25.1\n` | Read MAX32690 die temperature |
+
 
 ### CN0575 (TCP port 10000)
 
