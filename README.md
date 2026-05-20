@@ -181,7 +181,36 @@ make -j && sudo make install
 sudo apt-get install -y network-manager
 ```
 
-### Phase 3 — Network Configuration
+### Phase 3 — Build Firmware
+
+Build both APARD projects. Each project's Makefile defaults to `apard_communication_example`, so override with the `EXAMPLE=` flag to build the LED control examples instead.
+
+#### APARD #1 — `apard_led_control_example` (ADIN2111, IP 192.168.98.50)
+
+```bash
+cd ~/no-OS/projects/apardpfwd
+make clean && make RELEASE=y -j EXAMPLE=apard_led_control_example
+cp build/apardpfwd.elf /home/analog/apard1.elf
+```
+
+#### APARD #2 — `apardspoe_led_control_example` (ADIN1110, IP 192.168.98.60)
+
+```bash
+cd ~/no-OS/projects/apardspoe
+make clean && make RELEASE=y -j EXAMPLE=apardspoe_led_control_example
+cp build/apardspoe.elf /home/analog/apard2.elf
+```
+
+#### SWIOT1L Firmware
+
+Download the pre-built SWIOT1L static IP firmware from the official release:
+
+```bash
+wget -O /home/analog/swiot1l_static_ip.hex \
+    https://github.com/analogdevicesinc/no-OS/releases/download/swiot1l-v1.1.0/swiot1l_maxim_swiot1l_static_ip.hex
+```
+
+### Phase 4 — Network Configuration
 
 The demo uses multiple network interfaces and subnets. Configure each on the main RPi.
 
@@ -230,35 +259,6 @@ ping -c 3 192.168.98.50   # APARD #1
 ping -c 3 192.168.98.60   # APARD #2
 ping -c 3 192.168.10.2    # CN0575
 ping -c 3 192.168.97.40   # SWIOT1L
-```
-
-### Phase 4 — Build Firmware
-
-Build both APARD projects. Each project's Makefile defaults to `apard_communication_example`, so override with the `EXAMPLE=` flag to build the LED control examples instead.
-
-#### APARD #1 — `apard_led_control_example` (ADIN2111, IP 192.168.98.50)
-
-```bash
-cd ~/no-OS/projects/apardpfwd
-make clean && make RELEASE=y -j EXAMPLE=apard_led_control_example
-cp build/apardpfwd.elf /home/analog/apard1.elf
-```
-
-#### APARD #2 — `apardspoe_led_control_example` (ADIN1110, IP 192.168.98.60)
-
-```bash
-cd ~/no-OS/projects/apardspoe
-make clean && make RELEASE=y -j EXAMPLE=apardspoe_led_control_example
-cp build/apardspoe.elf /home/analog/apard2.elf
-```
-
-#### SWIOT1L Firmware
-
-Download the pre-built SWIOT1L static IP firmware from the official release:
-
-```bash
-wget -O /home/analog/swiot1l_static_ip.hex \
-    https://github.com/analogdevicesinc/no-OS/releases/download/swiot1l-v1.1.0/swiot1l_maxim_swiot1l_static_ip.hex
 ```
 
 ### Phase 5 — Flash Firmware
