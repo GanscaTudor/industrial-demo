@@ -153,6 +153,131 @@ class BoardPanel(ttk.LabelFrame):
         self.status_label.config(text="Unreachable", foreground="red")
 
 
+class ServoBoardPanel(ttk.LabelFrame):
+    """UI panel for an APARD board driving two servomotors."""
+
+    def __init__(self, parent, board_name, ip, log_callback):
+        super().__init__(parent, text=f"  {board_name} ({ip})  ", padding=10)
+        self.board_name = board_name
+        self.ip = ip
+        self.log = log_callback
+        self._build_ui()
+
+    def _build_ui(self):
+        # -- Status --
+        status_frame = ttk.Frame(self)
+        status_frame.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(status_frame, text="Status:").pack(side="left")
+        self.status_label = ttk.Label(
+            status_frame, text="Unknown", foreground="gray",
+            font=("TkDefaultFont", 10, "bold")
+        )
+        self.status_label.pack(side="left", padx=6)
+        ttk.Button(
+            status_frame, text="Test", command=self._test_connection
+        ).pack(side="right")
+
+        # -- Servo control --
+        servo_frame = ttk.LabelFrame(self, text="Servo Control", padding=6)
+        servo_frame.pack(fill="x", pady=4)
+
+        # Servo 1 row
+        s1_row = ttk.Frame(servo_frame)
+        s1_row.pack(fill="x", pady=2)
+        ttk.Label(s1_row, text="Servo 1:", width=8).pack(side="left")
+        ttk.Button(
+            s1_row, text="ON", command=lambda: self._send("SERVO1_ON")
+        ).pack(side="left", padx=2, expand=True, fill="x")
+        ttk.Button(
+            s1_row, text="OFF", command=lambda: self._send("SERVO1_OFF")
+        ).pack(side="left", padx=2, expand=True, fill="x")
+
+        # Servo 2 row
+        s2_row = ttk.Frame(servo_frame)
+        s2_row.pack(fill="x", pady=2)
+        ttk.Label(s2_row, text="Servo 2:", width=8).pack(side="left")
+        ttk.Button(
+            s2_row, text="ON", command=lambda: self._send("SERVO2_ON")
+        ).pack(side="left", padx=2, expand=True, fill="x")
+        ttk.Button(
+            s2_row, text="OFF", command=lambda: self._send("SERVO2_OFF")
+        ).pack(side="left", padx=2, expand=True, fill="x")
+
+        # Status button row
+        status_row = ttk.Frame(servo_frame)
+        status_row.pack(fill="x", pady=(4, 0))
+        ttk.Button(
+            status_row, text="Servo Status",
+            command=lambda: self._send("SERVO_STATUS")
+        ).pack(fill="x", padx=2)
+
+        self.servo1_state_label = ttk.Label(
+            servo_frame, text="Servo 1: --",
+            font=("TkDefaultFont", 10)
+        )
+        self.servo1_state_label.pack(pady=(6, 0))
+
+        self.servo2_state_label = ttk.Label(
+            servo_frame, text="Servo 2: --",
+            font=("TkDefaultFont", 10)
+        )
+        self.servo2_state_label.pack(pady=(2, 0))
+
+    def _test_connection(self):
+        def worker():
+            resp = send_command(self.ip, "SERVO_STATUS")
+            self.after(0, lambda: self._on_test_result(resp))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_test_result(self, resp):
+        if resp is not None:
+            self.status_label.config(text="Reachable", foreground="green")
+            self.log(self.board_name, f"Board reachable at {self.ip}")
+            self._parse_status(resp)
+        else:
+            self.status_label.config(text="Unreachable", foreground="red")
+            self.log(self.board_name, f"Cannot reach {self.ip}")
+
+    def _send(self, cmd):
+        def worker():
+            self.after(0, lambda: self.log(self.board_name, f">> {cmd}"))
+            resp = send_command(self.ip, cmd)
+            if resp is None:
+                self.after(0, lambda: self._on_error(cmd))
+                return
+            self.after(0, lambda: self._on_response(cmd, resp))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_response(self, cmd, resp):
+        self.log(self.board_name, f"<< {resp}")
+        self.status_label.config(text="Reachable", foreground="green")
+
+        if cmd == "SERVO1_ON" and resp == "OK":
+            self.servo1_state_label.config(text="Servo 1: ON")
+        elif cmd == "SERVO1_OFF" and resp == "OK":
+            self.servo1_state_label.config(text="Servo 1: OFF")
+        elif cmd == "SERVO2_ON" and resp == "OK":
+            self.servo2_state_label.config(text="Servo 2: ON")
+        elif cmd == "SERVO2_OFF" and resp == "OK":
+            self.servo2_state_label.config(text="Servo 2: OFF")
+        elif cmd == "SERVO_STATUS":
+            self._parse_status(resp)
+
+    def _parse_status(self, resp):
+        # Accepts formats like "SERVO1:ON SERVO2:OFF" or "SERVO1:ON,SERVO2:OFF"
+        tokens = resp.replace(",", " ").split()
+        for tok in tokens:
+            if tok.startswith("SERVO1:"):
+                self.servo1_state_label.config(text=f"Servo 1: {tok[7:]}")
+            elif tok.startswith("SERVO2:"):
+                self.servo2_state_label.config(text=f"Servo 2: {tok[7:]}")
+
+    def _on_error(self, cmd):
+        self.log(self.board_name, f"<< ERROR: no response to {cmd}")
+        self.status_label.config(text="Unreachable", foreground="red")
+
+
 class CN0575Panel(ttk.LabelFrame):
     """UI panel for CN0575 with ADT75 temperature graph."""
 
@@ -584,7 +709,7 @@ class ControlPanel(tk.Tk):
         top_frame = ttk.Frame(self)
         top_frame.pack(fill="x", padx=10, pady=5)
 
-        self.board1 = BoardPanel(
+        self.board1 = ServoBoardPanel(
             top_frame, "APARD #1", APARD1_IP, self._log_message
         )
         self.board1.pack(side="left", fill="both", expand=True, padx=(0, 5))

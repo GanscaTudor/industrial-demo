@@ -1,6 +1,6 @@
 # Industrial Demo — 10BASE-T1L Control Network
 
-Industrial control network demo using Analog Devices 10BASE-T1L Single Pair Ethernet. A Raspberry Pi running Kuiper Linux 2 acts as the central controller, communicating with multiple ADI evaluation boards over T1L to control LEDs, read temperatures, and drive a DC fan — all managed from a single Python GUI.
+Industrial control network demo using Analog Devices 10BASE-T1L Single Pair Ethernet. A Raspberry Pi running Kuiper Linux 2 acts as the central controller, communicating with multiple ADI evaluation boards over T1L to drive servomotors, control an LED, read temperatures, and drive a DC fan — all managed from a single Python GUI.
 
 ## Hardware
 
@@ -15,7 +15,8 @@ Industrial control network demo using Analog Devices 10BASE-T1L Single Pair Ethe
 
 ### Additional Components
 
-- 2x LED + 330 ohm resistor (wired to P2.7 / GPIO_2 on each APARD board header P7)
+- 2x servomotors connected to APARD #1 (driven over TMR1 and TMR2 pins)
+- 1x LED + 330 ohm resistor on APARD #2 (wired to P2.7 / GPIO_2 on header P7)
 - DC fan connected to SWIOT1L MAX14906 channel 0 (digital output for PWM)
 - Single Pair Ethernet cables (T1L) between Main RPi, APARD #1, APARD #2, and CN0575
 - SWIOT1L connects to the main RPi via the AD-T1LUSB-EBZ USB-to-T1L adapter (not directly through the T1LPSE)
@@ -114,7 +115,7 @@ git clone --recursive https://github.com/GanscaTudor/no-OS.git --branch industri
 ```
 
 This branch contains two projects used in the demo:
-- `projects/apardpfwd` — `apard_led_control_example` for APARD #1 (ADIN2111 / PFWD shield)
+- `projects/apardpfwd` — apard_servo_control example for APARD #1 (ADIN2111 / PFWD shield) — the firmware must expose `SERVO1_ON`, `SERVO1_OFF`, `SERVO2_ON`, `SERVO2_OFF`, `SERVO_STATUS` over TCP port 10000
 - `projects/apardspoe` — `apardspoe_led_control_example` for APARD #2 (ADIN1110 / SPOE shield)
 
 Append the required peripheral driver sources to each project's build file:
@@ -183,13 +184,15 @@ sudo apt-get install -y network-manager
 
 ### Phase 3 — Build Firmware
 
-Build both APARD projects. Each project's Makefile defaults to `apard_communication_example`, so override with the `EXAMPLE=` flag to build the LED control examples instead.
+Build both APARD projects. Each project's Makefile defaults to `apard_communication_example`, so override with the `EXAMPLE=` flag to build the desired example.
 
-#### APARD #1 — `apard_led_control_example` (ADIN2111, IP 192.168.98.50)
+#### APARD #1 — apard_servo_control (ADIN2111, IP 192.168.98.50)
+
+
 
 ```bash
 cd ~/no-OS/projects/apardpfwd
-make clean && make RELEASE=y -j EXAMPLE=apard_led_control_example
+make clean && make RELEASE=y -j EXAMPLE=<apard_servo_control>
 cp build/apardpfwd.elf /home/analog/apard1.elf
 ```
 
@@ -316,7 +319,8 @@ python3 RPI_T1LPSE/main_app.py
 
 The GUI provides:
 
-- **APARD #1 and #2** — LED on/off control, LED status readback, and die temperature reading over TCP
+- **APARD #1** — Independent ON/OFF control for two servomotors (Servo 1, Servo 2) plus servo status readback over TCP
+- **APARD #2** — LED on/off control and LED status readback over TCP
 - **CN0575** — Live ADT75 temperature graph with auto-refresh
 - **SWIOT1L** — Fan PWM duty cycle control with live RPM graph (via pyadi-iio)
 
