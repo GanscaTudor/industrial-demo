@@ -1,0 +1,149 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR BSD-3-Clause)
+/*
+ * Overlay for EVAL-CN0575-RPIZ with ADXL355 accelerometer
+ * CN0575 (ADIN1110 Ethernet + ADT75 temperature sensor) on SPI0 CS0 (GPIO8)
+ * ADXL355 3-axis accelerometer on SPI1 CS0 (GPIO18), MODE3
+ *
+ * Copyright 2026 Analog Devices Inc.
+ */
+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	compatible = "brcm,bcm2835", "brcm,bcm2708", "brcm,bcm2709";
+};
+
+&spidev0 {
+	status = "disabled";
+};
+
+&gpio {
+	/* ADXL355 DRDY interrupt pin */
+	adxl355_irq_pin: adxl355_irq_pin {
+		brcm,pins = <24>;
+		brcm,function = <0>; /* input */
+	};
+
+	/* SPI1 data pins (GPIO19=MISO, GPIO20=MOSI, GPIO21=SCK) - alt4 */
+	spi1_data_pins: spi1_data_pins {
+		brcm,pins = <19 20 21>;
+		brcm,function = <3>; /* alt4 */
+	};
+
+	/* SPI1 CS0 pin (GPIO18) - managed as GPIO by SPI controller */
+	spi1_cs_pin: spi1_cs_pin {
+		brcm,pins = <18>;
+		brcm,function = <1>; /* output */
+		brcm,pull = <2>;
+	};
+
+	/* ADIN1110 interrupt pin (active-low) */
+	cn0575_irq_pin: cn0575_irq_pin {
+		brcm,pins = <25>;
+		brcm,function = <0>; /* input */
+		brcm,pull = <2>; /* pull-up */
+	};
+
+	gpio_overrides: gpio_overrides {
+		/* ADIN1110 reset - held high */
+		pin-adin1110-reset {
+			pins = "gpio27";
+			function = "gpio_out";
+			bias-pull-up;
+			output-high;
+			export;
+		};
+	};
+};
+
+/* CN0575: ADIN1110 on SPI0 CS0 */
+&spi0 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	ethernet@0 {
+		compatible = "adi,adin1110";
+		reg = <0>;
+		spi-max-frequency = <25000000>;
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		interrupt-parent = <&gpio>;
+		interrupts = <25 IRQ_TYPE_LEVEL_LOW>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&cn0575_irq_pin>;
+		mac-address = [ CA 2F B7 10 23 63 ];
+
+		phy@0 {
+			compatible = "ethernet-phy-id0283.bc91";
+			reg = <0x0>;
+		};
+	};
+};
+
+/* Enable auxiliary peripheral block (required for SPI1) */
+&aux {
+	status = "okay";
+};
+
+/* ADXL355 on SPI1 CS0 (GPIO18-21) */
+&spi1 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&spi1_data_pins &spi1_cs_pin>;
+	cs-gpios = <&gpio 18 1>; /* active low */
+	status = "okay";
+
+	adxl355: adxl355@0 {
+		compatible = "adi,adxl355";
+		reg = <0>;
+		spi-max-frequency = <1000000>;
+		interrupt-parent = <&gpio>;
+		interrupts = <24 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "DRDY";
+		pinctrl-names = "default";
+		pinctrl-0 = <&adxl355_irq_pin>;
+	};
+};
+
+/* CN0575: ADT75 temperature sensor on I2C1 */
+&i2c1 {
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	adt75@48 {
+		compatible = "adi,adt75";
+		reg = <0x48>;
+	};
+};
+
+/* CN0575: GPIO button and LED */
+&{/} {
+	one-bit-adc-dac {
+		compatible = "adi,one-bit-adc-dac";
+		label = "gpios";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		in-gpios = <&gpio 16 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+		out-gpios = <&gpio 26 GPIO_ACTIVE_HIGH>;
+		status = "okay";
+
+		channel@0 {
+			reg = <0>;
+			label = "EXT_BTN";
+		};
+
+		channel@1 {
+			reg = <1>;
+			label = "EXT_LED";
+		};
+	};
+};

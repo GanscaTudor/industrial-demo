@@ -9,7 +9,7 @@ Industrial control network demo using Analog Devices 10BASE-T1L Single Pair Ethe
 | Raspberry Pi 4 + [AD-RPI-T1LPSE-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-rpi-t1lpse-sl.html) | Main controller — runs the GUI, acts as TCP client and SPoE PSE | 192.168.98.1 |
 | [AD-APARD32690-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-apard32690-sl.html) #1 + [AD-APARDPFWD-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-apardpfw-sl.html) | APARD #1 — MAX32690 MCU with ADIN2111 (dual-port T1L MAC-PHY) | 192.168.98.50 |
 | [AD-APARD32690-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-apard32690-sl.html) #2 + [AD-APARDSPOE-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-apardspoe-sl.html) | APARD #2 — MAX32690 MCU with ADIN1110 (single-port T1L MAC-PHY) | 192.168.98.60 |
-| Raspberry Pi 4 + [EVAL-CN0575-RPIZ](https://analogdevicesinc.github.io/documentation/solutions/reference-designs/eval-cn0575-rpiz/index.html) | CN0575 — ADT75 temperature sensor over T1L | 192.168.10.2 |
+| Raspberry Pi 4 + [EVAL-CN0575-RPIZ](https://analogdevicesinc.github.io/documentation/solutions/reference-designs/eval-cn0575-rpiz/index.html) | CN0575 — ADT75 temperature sensor and ADXL355 over T1L | 192.168.10.2 |
 | [AD-T1LUSB-EBZ](https://analogdevicesinc.github.io/documentation/solutions/reference-designs/ad-apard32690-sl/ad-t1lusb-ebz/index.html) | USB-to-T1L adapter — plugged into a USB port on the main RPi | — |
 | [EVAL-AD-SWIOT1L-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-swiot1l-sl.html) | SWIOT1L — MAX14906 digital output + AD74413R analog I/O (independently powered) | 192.168.97.40 |
 
@@ -18,6 +18,7 @@ Industrial control network demo using Analog Devices 10BASE-T1L Single Pair Ethe
 - 2x servomotors connected to APARD #1 (driven over TMR1 and TMR2 pins)
 - 1x LED + 330 ohm resistor on APARD #2 (wired to P2.7 / GPIO_2 on header P7)
 - DC fan connected to SWIOT1L MAX14906 channel 0 (digital output for PWM)
+- EVAL-ADXL355-PMDZ connected on SPI1 of the Raspberry Pi 4 + CN0575
 - Single Pair Ethernet cables (T1L) between Main RPi, APARD #1, APARD #2, and CN0575
 - SWIOT1L connects to the main RPi via the AD-T1LUSB-EBZ USB-to-T1L adapter (not directly through the T1LPSE)
 - USB cables for flashing APARD boards via DAPLINK
@@ -49,22 +50,63 @@ pyadi-iio
 
 ### Phase 1 — System Verification
 
-Make sure both Raspberry Pis are running [ADI Kuiper Linux 2.0](https://wiki.analog.com/resources/tools-software/linux-software/kuiper-linux):
+#### Build a Custom Kuiper Image for the AD-RPI-T1LPSE-SL
 
-Verify the AD-RPI-T1LPSE hat is seated on the main RPi's 40-pin GPIO header. Then check that the T1L PSE device tree overlay is applied:
+Clone the ADI Kuiper repository on a build machine (not the target RPi) using the branch specific to the AD-RPI-T1LPSE-SL:
 
 ```bash
-grep "dtoverlay=rpi-t1lpse-class12" /boot/config.txt
+git clone --depth 1 --branch kuiper-AD-RPI-T1LPSE-SL https://github.com/analogdevicesinc/kuiper
+cd kuiper
+sudo ./build-docker.sh
 ```
 
-If the overlay is missing, add it:
+For full build options see the [Kuiper Quick Start](https://wiki.analog.com/resources/tools-software/linux-software/kuiper-linux). Once the image is built, write it to a micro-SD card and boot the Raspberry Pi.
 
-Make sure it was added under [Pi4] section if you are using a Raspberry Pi 4.
-If using a Raspberry Pi 5, change [cm5] to [Pi5] and put the overlay under that section.
+#### Configure the SD Card for ADI-RPI-T1LPSE-SL
+
+The Linux kernel requires a device tree overlay to identify the AD-RPI-T1LPSE-SL hardware. The overlay is included in Kuiper and only needs to be enabled. Add the following line to `/boot/config.txt`:
+
+```
+dtoverlay=rpi-t1lpse-class12
+```
+
+Place this line under the `[Pi4]` section for Raspberry Pi 4, or under `[Pi5]` for Raspberry Pi 5.
+
+```
+
 After reboot, confirm the overlay is loaded:
 
 ```bash
 dtoverlay -l | grep t1lpse
+```
+
+#### Configure the SD Card for CN0575
+
+To use the EVAL-CN0575-RPIZ with the Raspberry Pi, the micro-SD card should be preloaded with [Kuiper Linux](https://wiki.analog.com/resources/tools-software/linux-software/kuiper-linux).
+
+Complete instructions, including where to download the SD card image, how to write it to the micro-SD card, and how to configure the system are provided at the [Kuiper page](https://wiki.analog.com/resources/tools-software/linux-software/kuiper-linux).
+
+#### Enable the CN0575 + ADXL355 Overlay
+
+The `rpi-cn0575-adxl355-overlay` is a custom overlay (not part of the standard Kuiper or Raspberry Pi overlay set). It must be compiled from source and installed manually before it can be enabled.
+
+Compile the overlay on the CN0575 Raspberry Pi:
+
+```bash
+dtc -@ -I dts -O dtb -o rpi-cn0575-adxl355-overlay.dtbo RPI_CN0575/rpi-cn0575-adxl355-overlay.dts
+sudo cp rpi-cn0575-adxl355-overlay.dtbo /boot/overlays/
+```
+
+Add the following line to `/boot/config.txt`:
+
+```
+dtoverlay=rpi-cn0575-adxl355-overlay
+```
+
+Reboot and confirm the overlay is loaded:
+
+```bash
+dtoverlay -l | grep cn0575-adxl
 ```
 
 ### Phase 2 — Install Prerequisites
@@ -213,7 +255,38 @@ wget -O /home/analog/swiot1l_static_ip.hex \
     https://github.com/analogdevicesinc/no-OS/releases/download/swiot1l-v1.1.0/swiot1l_maxim_swiot1l_static_ip.hex
 ```
 
-### Phase 4 — Network Configuration
+### Phase 4 — Flash Firmware
+
+All boards are flashed using OpenOCD with a MaxDAP Pico (CMSIS-DAP) programmer.
+
+#### Flash APARD #1
+
+Connect the MaxDAP Pico to APARD #1, then run:
+
+```bash
+openocd -f interface/cmsis-dap.cfg -f target/max32690.cfg \
+    -c "program /home/analog/apard1.elf verify reset exit"
+```
+
+#### Flash APARD #2
+
+Move the MaxDAP Pico to APARD #2, then run:
+
+```bash
+openocd -f interface/cmsis-dap.cfg -f target/max32690.cfg \
+    -c "program /home/analog/apard2.elf verify reset exit"
+```
+
+#### Flash SWIOT1L
+
+Connect the DAPLink to the SWIOT1L board, then run:
+
+```bash
+openocd -f interface/cmsis-dap.cfg -f target/max32690.cfg \
+    -c "program /home/analog/swiot1l_static_ip.hex verify reset exit"
+```
+
+### Phase 5 — Network Configuration
 
 The demo uses multiple network interfaces and subnets. Configure each on the main RPi.
 
@@ -264,64 +337,47 @@ ping -c 3 192.168.10.2    # CN0575
 ping -c 3 192.168.97.40   # SWIOT1L
 ```
 
-### Phase 5 — Flash Firmware
-
-All boards are flashed using OpenOCD with a MaxDAP Pico (CMSIS-DAP) programmer.
-
-#### Flash APARD #1
-
-Connect the MaxDAP Pico to APARD #1, then run:
-
-```bash
-openocd -f interface/cmsis-dap.cfg -f target/max32690.cfg \
-    -c "program /home/analog/apard1.elf verify reset exit"
-```
-
-#### Flash APARD #2
-
-Move the MaxDAP Pico to APARD #2, then run:
-
-```bash
-openocd -f interface/cmsis-dap.cfg -f target/max32690.cfg \
-    -c "program /home/analog/apard2.elf verify reset exit"
-```
-
-#### Flash SWIOT1L
-
-Connect the DAPLink to the SWIOT1L board, then run:
-
-```bash
-openocd -f interface/cmsis-dap.cfg -f target/max32690.cfg \
-    -c "program /home/analog/swiot1l_static_ip.hex verify reset exit"
-```
-
 ### Phase 6 — Start the Demo
 
-#### 1. Start the CN0575 temperature server
+#### 1. Start the CN0575 and ADXL355 server
 
 On the CN0575 Raspberry Pi:
 
+Clone the demo repository:
 ```bash
 ssh analog@192.168.10.2
-python3 /home/analog/cn0575_state_machine.py
+git clone https://github.com/ganscatudor/industrial-demo
 ```
 
-This starts a TCP server on port 10000 that reads the ADT75 temperature sensor via IIO and responds to `READ_TEMP` commands.
+Start the servers:
+
+```bash
+ssh analog@192.168.10.2
+python3 /home/analog/industrial-demo/RPI_CN0575/adxl355_server.py --rate 1000 --chunk 256 --port 50055
+python3 /home/analog/industrial-demo/RPI_CN0575/cn0575_state_machine.py
+```
+
+This starts a TCP server that reads the ADXL355 accelerations and temperature readings from adt75.
 
 #### 2. Run the control panel
 
 On the main RPi:
 
+Clone the demo repository
+```bash
+git clone https://github.com/ganscatudor/industrial-demo
+```
+
 ```bash
 pip3 install matplotlib pyadi-iio
-python3 RPI_T1LPSE/main_app.py
+python3 RPI_T1LPSE/demo.py --adxl-host 192.168.10.2
 ```
 
 The GUI provides:
 
 - **APARD #1** — Independent ON/OFF control for two servomotors (Servo 1, Servo 2) plus servo status readback over TCP
 - **APARD #2** — LED on/off control and LED status readback over TCP
-- **CN0575** — Live ADT75 temperature graph with auto-refresh
+- **CN0575** — Live ADXL355 vibration monitoring and ADT75 temperature graph with auto-refresh
 - **SWIOT1L** — Fan PWM duty cycle control with live RPM graph (via pyadi-iio)
 
 ## Communication Protocols
