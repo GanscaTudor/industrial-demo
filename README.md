@@ -36,7 +36,7 @@ Industrial control network demo using Analog Devices 10BASE-T1L Single Pair Ethe
 | Main RPi (T1LPSE) | [ADI Kuiper Linux 2.0](https://wiki.analog.com/resources/tools-software/linux-software/kuiper-linux) |
 | CN0575 RPi | [ADI Kuiper Linux 2.0](https://wiki.analog.com/resources/tools-software/linux-software/kuiper-linux) |
 | APARD #1 and #2 | [no-OS](https://github.com/analogdevicesinc/no-OS) bare-metal C (MAX32690) |
-| SWIOT1L | [no-OS](https://github.com/analogdevicesinc/no-OS) bare-metal C (MAX32670) |
+| SWIOT1L | [no-OS](https://github.com/analogdevicesinc/no-OS) bare-metal C (MAX32650) |
 
 ### Python Dependencies (Main RPi)
 
