@@ -523,6 +523,10 @@ class ColorSensorPanel(CardPanel):
         self.auto_refresh_var = tk.BooleanVar(value=False)
         self._poll_running = True
         self._sequence_active = False
+        # Gates cube detection -> servo actuation. Polling and the readout run
+        # regardless; this only decides whether a detected cube is acted on, so
+        # the sensor can be watched and calibrated before the line is armed.
+        self._sorting_enabled = False
         # Tracks the color of whatever cube is currently sitting under the
         # sensor (None if nothing above threshold), plus whether that
         # specific physical cube has already been acted on / had its
@@ -537,7 +541,21 @@ class ColorSensorPanel(CardPanel):
         threading.Thread(target=self._poll_loop, daemon=True).start()
 
     def _build_ui(self):
-        self.status_row(button_text="Test", button_cmd=self._test_connection)
+        row, _ = self.status_row(button_text="Test", button_cmd=self._test_connection)
+
+        # Packed side="right" after Test, so it lands left of it.
+        # min_width keeps the card from reflowing when the label changes length.
+        self._btn_sort = Button(row, self.tm, "Start Sorting", self._toggle_sorting,
+                                variant="primary", height=28, min_width=110)
+        self._btn_sort.pack(side="right", padx=(0, XS))
+
+        # Colour is never the only indicator (CLAUDE.md): the wording carries the
+        # state too, for the same reason set_status() changes both.
+        self.sort_status_label = tk.Label(self.body, text="Sorting stopped",
+                                          fg=NEUTRAL[500], font=self.tm.font_small,
+                                          anchor="w")
+        self.sort_status_label.pack(fill="x")
+        self._frames.append(self.sort_status_label)   # bg only; fg carries state
 
         # No LabelFrame wrapper here (unlike the other panels): its title would
         # only repeat the card's own subtitle, and the border plus its internal
@@ -682,9 +700,44 @@ class ColorSensorPanel(CardPanel):
             self.log(self.board_name, f"<< {resp}")
             self._apply_reading(resp, record=True)
 
+    def _toggle_sorting(self):
+        """Arm or disarm cube detection -> servo actuation."""
+        if self._sorting_enabled:
+            self._stop_sorting()
+        else:
+            self._start_sorting()
+
+    def _start_sorting(self):
+        self._sorting_enabled = True
+        # Clear the latch so a cube already sitting under the sensor when the
+        # line is armed is picked up on the next poll rather than being treated
+        # as already-handled.
+        self._cube_color = None
+        self._cube_handled = False
+        self._cube_ignore_logged = False
+        self._btn_sort.label = "Stop Sorting"
+        self._btn_sort.variant = "secondary"
+        self._btn_sort.render()
+        self.sort_status_label.config(text="Sorting running", fg=SUCCESS[500])
+        self.log(self.board_name, "Sorting started - cube detection armed")
+
+    def _stop_sorting(self):
+        self._sorting_enabled = False
+        self._btn_sort.label = "Start Sorting"
+        self._btn_sort.variant = "primary"
+        self._btn_sort.render()
+        self.sort_status_label.config(text="Sorting stopped", fg=NEUTRAL[500])
+        self.log(self.board_name, "Sorting stopped - cube detection disarmed")
+
     def _check_cube_trigger(self, r, g, b):
         """Detect a color cube under the sensor from raw RGB counts and
         trigger the matching servo sequence. Runs on every poll."""
+        # Detection is gated on the Start Sorting button, but an in-flight servo
+        # sequence is left to finish on its own timers so a servo can't be
+        # stranded in the ON position by disarming mid-cycle.
+        if not self._sorting_enabled:
+            return
+
         max_val = max(r, g, b)
 
         if max_val < COLOR_CUBE_THRESHOLD:
