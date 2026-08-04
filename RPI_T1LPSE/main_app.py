@@ -37,7 +37,7 @@ from collections import deque
 import numpy as np
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, simpledialog
 
 from design_system import (
     PRIMARY, NEUTRAL, SUCCESS, WARNING, ERROR, INFO,
@@ -104,22 +104,23 @@ M_S2_TO_G = 1.0 / 9.80665
 # started detached and concurrently -- running them in sequence would block on
 # the first and never bind the ADXL port.
 REMOTE_HOST = f"analog@{CN0575_IP}"
-REMOTE_DIR = "industrial-demo/RPI_CN0575"
 REMOTE_LOG_DIR = "/tmp"
 SSH_CONNECT_TIMEOUT = 8          # seconds; the ssh call itself returns at once
 REMOTE_SERVERS = (
-    # (label, script, args, log basename)
-    ("CN0575 command server", "cn0575_state_machine.py", "", "cn0575_state_machine"),
-    ("ADXL355 data server", "adxl355_server.py",
+    # (label, directory, script, args, log basename)
+    ("CN0575 command server", "industrial-demo/RPI_CN0575",
+     "cn0575_state_machine.py", "", "cn0575_state_machine"),
+    ("ADXL355 data server", "vibration-demo",
+     "adxl355_server.py",
      f"--rate {ADXL_FS} --chunk {ADXL_CHUNK} --port {args.adxl_port}",
      "adxl355_server"),
 )
 
 # Predictive maintenance thresholds
-THRESH_WARN = 0.10
-THRESH_ALARM = 0.50
-CREST_WARN = 4.0
-KURT_WARN = 4.0
+THRESH_WARN = 2000.0
+THRESH_ALARM = 6000.0
+CREST_WARN = 6.0
+KURT_WARN = 6.0
 
 AXIS_NAMES = ["X", "Y", "Z"]
 
@@ -345,9 +346,11 @@ def compute_metrics(samples):
 
 def health_level(rms, cf, kurt):
     """Determine health status from metrics."""
+    if rms < THRESH_WARN:
+        return "OK"
     if rms >= THRESH_ALARM or cf >= CREST_WARN * 1.5 or kurt >= KURT_WARN * 2:
         return "ALARM"
-    if rms >= THRESH_WARN or cf >= CREST_WARN or kurt >= KURT_WARN:
+    if cf >= CREST_WARN or kurt >= KURT_WARN:
         return "WARNING"
     return "OK"
 
@@ -681,13 +684,14 @@ class ColorSensorPanel(CardPanel):
         of the 'Live' checkbox, so cube detection is always active."""
         while self._poll_running:
             resp = send_command(self.ip, "COLOR_READ")
-            self.after(0, lambda r=resp: self._on_poll_result(r))
+            try:
+                self.after(0, lambda r=resp: self._on_poll_result(r))
+            except RuntimeError:
+                pass
             time.sleep(COLOR_AUTO_REFRESH_MS / 1000.0)
 
     def _on_poll_result(self, resp):
         if resp is None or not resp.startswith("R:"):
-            if self.auto_refresh_var.get():
-                self.set_status("Unreachable", "error")
             return
 
         self.set_status("Reachable", "ok")
@@ -907,7 +911,7 @@ class ColorSensorPanel(CardPanel):
             v_min, v_max = min(all_vals), max(all_vals)
             margin = max(50, (v_max - v_min) * 0.2)
             self.ax.set_ylim(max(0, v_min - margin), v_max + margin)
-        self.canvas.draw_idle()
+        self.canvas.draw()
 
     def _clear_graph(self):
         for hist in self.rgb_history:
@@ -919,7 +923,7 @@ class ColorSensorPanel(CardPanel):
                 line.set_data([], [])
             self.ax.set_xlim(0, 10)
             self.ax.set_ylim(0, 100)
-            self.canvas.draw_idle()
+            self.canvas.draw()
 
     def _toggle_auto_refresh(self):
         # Background polling (_poll_loop) always runs; this only controls
@@ -1421,6 +1425,9 @@ class ADXL355Panel(CardPanel):
         self._running = False
         self._update_id = None
         self._prev_level = ["OK"] * 3
+        # Cached for the app's lifetime, never written to disk. Cleared on auth
+        # failure so a typo can be corrected without restarting.
+        self._ssh_password = None
 
         # FFT helpers
         self._window = np.hanning(ADXL_FFT_WIN)
@@ -1564,22 +1571,40 @@ class ADXL355Panel(CardPanel):
         would freeze the window. Results come back via after(0, ...) like every
         other worker in this app.
         """
+        # Prompted on the UI thread, before the worker starts: a modal dialog
+        # cannot be raised from a background thread.
+        if self._ssh_password is None:
+            self._ssh_password = simpledialog.askstring(
+                "SSH password", f"Password for {REMOTE_HOST}:",
+                show="*", parent=self)
+        if not self._ssh_password:
+            self.log(self.board_name, "<< cancelled: no password entered")
+            return
+
         self._btn_servers.set_enabled(False)
         self.log(self.board_name, f">> ssh {REMOTE_HOST}: starting servers")
 
         def worker():
+            # sshpass -e reads SSHPASS from the environment; -p would expose the
+            # password in the process list to every user on the machine.
+            ssh_env = dict(os.environ, SSHPASS=self._ssh_password)
+            ssh_base = ["sshpass", "-e",
+                        "ssh", "-o", "StrictHostKeyChecking=no",
+                        "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
+                        REMOTE_HOST]
             try:
-                proc = subprocess.run(
-                    ["ssh", "-o", "BatchMode=yes",
-                     "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
-                     REMOTE_HOST, self._remote_launch_script()],
-                    capture_output=True, text=True,
-                    timeout=SSH_CONNECT_TIMEOUT + 10)
+                kill_cmd, launch_cmd = self._remote_launch_commands()
+                subprocess.run(ssh_base + [kill_cmd],
+                               capture_output=True, text=True, env=ssh_env,
+                               timeout=SSH_CONNECT_TIMEOUT + 5)
+                proc = subprocess.run(ssh_base + [launch_cmd],
+                                      capture_output=True, text=True, env=ssh_env,
+                                      timeout=SSH_CONNECT_TIMEOUT + 20)
             except subprocess.TimeoutExpired:
                 self.after(0, lambda: self._on_servers_done(
                     False, "ssh timed out (host unreachable?)"))
                 return
-            except OSError as exc:               # ssh binary missing
+            except OSError as exc:
                 self.after(0, lambda e=exc: self._on_servers_done(
                     False, f"cannot run ssh: {e}"))
                 return
@@ -1590,27 +1615,32 @@ class ADXL355Panel(CardPanel):
         threading.Thread(target=worker, daemon=True).start()
 
     @staticmethod
-    def _remote_launch_script():
-        """Shell script run on the Pi: one detached server per entry.
+    def _remote_launch_commands():
+        """Return (kill_cmd, launch_cmd) for two separate SSH calls.
 
-        setsid + nohup + closed stdin so each survives the SSH session closing
-        (a plain '&' dies with the session). Each is skipped if already running,
-        so the button is safe to press twice.
+        Splitting kill and launch avoids pkill -9 taking out the SSH
+        session that carries the launch command.
         """
-        lines = [f"cd {REMOTE_DIR} || exit 1"]
-        for _label, script, script_args, log in REMOTE_SERVERS:
-            lines.append(
-                f"pgrep -f {script} >/dev/null || "
-                f"setsid nohup python3 {script} {script_args} "
-                f">{REMOTE_LOG_DIR}/{log}.log 2>&1 </dev/null &"
+        kills = []
+        for _label, _dir, script, _a, _log in REMOTE_SERVERS:
+            pat = f"[{script[0]}]{script[1:]}"
+            kills.append(f"pkill -9 -f '{pat}' 2>/dev/null")
+        kill_cmd = " ; ".join(kills + ["sleep 1", "echo KILLED"])
+
+        launches = []
+        for _label, directory, script, script_args, log in REMOTE_SERVERS:
+            launches.append(
+                f"(nohup python3 ~/{directory}/{script} {script_args} "
+                f">{REMOTE_LOG_DIR}/{log}.log 2>&1 &)"
             )
-        # Give them a moment to bind, then report what is actually listening
-        # rather than assuming the launch worked.
-        lines.append("sleep 2")
-        for _label, script, _a, _log in REMOTE_SERVERS:
-            lines.append(f"pgrep -f {script} >/dev/null && echo UP:{script} "
-                         f"|| echo DOWN:{script}")
-        return "\n".join(lines)
+        checks = []
+        for _label, _dir, script, _a, _log in REMOTE_SERVERS:
+            pat = f"[{script[0]}]{script[1:]}"
+            checks.append(f"pgrep -f '{pat}' >/dev/null && echo UP:{script} "
+                          f"|| echo DOWN:{script}")
+        launch_cmd = " ; ".join(launches + ["sleep 6"] + checks)
+
+        return kill_cmd, launch_cmd
 
     def _on_servers_done(self, ok, detail):
         self._btn_servers.set_enabled(True)
@@ -1624,8 +1654,15 @@ class ADXL355Panel(CardPanel):
                                       f" (see {REMOTE_LOG_DIR}/*.log on the Pi)")
         else:
             # No UP/DOWN markers means the script never ran: auth or reachability.
-            hint = ("SSH key auth not configured" if "denied" in detail.lower()
-                    or "publickey" in detail.lower() else detail)
+            low = detail.lower()
+            if "denied" in low or "publickey" in low or "password" in low:
+                # Drop the cached password so the next press re-prompts.
+                self._ssh_password = None
+                hint = "authentication failed — check the password"
+            elif "sshpass" in low or "No such file" in detail:
+                hint = "sshpass not installed (apt install sshpass)"
+            else:
+                hint = detail
             self.log(self.board_name, f"<< ERROR: {hint or 'ssh failed'}")
 
     def _start(self):
@@ -1712,7 +1749,7 @@ class ADXL355Panel(CardPanel):
             if lo is not None:
                 pad = (hi - lo) * 0.15 + 1e-6
                 self.ax.set_ylim(lo - pad, hi + pad)
-            self.canvas.draw_idle()
+            self.canvas.draw()
 
     def cleanup(self):
         self._stop()
