@@ -42,8 +42,8 @@ from tkinter import ttk, scrolledtext, simpledialog
 from design_system import (
     PRIMARY, NEUTRAL, SUCCESS, WARNING, ERROR, INFO,
     THEMES, XS, SM, MD, LG, XL, XXL,
-    STATUS_COLOR, LEVEL_COLOR, AXIS_COLORS, COLOR_AXIS_COLORS,
-    pick_font, Button, Card, ThemeMixin,
+    LEVEL_COLOR, AXIS_COLORS, COLOR_AXIS_COLORS, status_text_color,
+    pick_font, Button, Card, FanIndicator, ThemeMixin,
 )
 
 try:
@@ -85,7 +85,7 @@ APARD2_IP = "192.168.98.60"
 CN0575_IP = "192.168.10.2"
 SWIOT_IP = "192.168.97.40"
 TCP_PORT = 10000
-TIMEOUT = 5.0
+TIMEOUT = 2.0
 AUTO_REFRESH_MS = 5000
 COLOR_AUTO_REFRESH_MS = 250  # 4 reads/sec over IP for the color sensor panel
 GRAPH_MAX_POINTS = 60
@@ -140,8 +140,8 @@ LOGO_HEIGHT = 30
 RED_SERVO_DELAY_S = 0.0
 RED_SERVO_ON_DURATION_S = 4.0
 
-GREEN_SERVO_DELAY_S = 3.0
-GREEN_SERVO_ON_DURATION_S = 4.0
+GREEN_SERVO_DELAY_S = 3
+GREEN_SERVO_ON_DURATION_S = 3.5
 
 
 # ---------------------------------------------------------------------------
@@ -425,10 +425,12 @@ class CardPanel(tk.Frame):
             w.configure(bg=t["card"], fg=t["text"])
         for w in self._muted_labels:
             w.configure(bg=t["card"], fg=t["text2"])
-        # The status label's fg encodes state, so only its bg follows the theme.
+        # The status label's fg encodes state, but the accessible shade for that
+        # state differs per theme, so it is re-resolved here rather than fixed.
         if getattr(self, "status_label", None) is not None:
-            self.status_label.configure(bg=t["card"],
-                                        fg=STATUS_COLOR[self._status_key])
+            self.status_label.configure(
+                bg=t["card"],
+                fg=status_text_color(self.tm.theme_name, self._status_key))
         self.style_plot()
 
     def style_plot(self):
@@ -483,7 +485,8 @@ class CardPanel(tk.Frame):
         alongside the colour.
         """
         self._status_key = key
-        self.status_label.config(text=text, fg=STATUS_COLOR[key],
+        self.status_label.config(text=text,
+                                 fg=status_text_color(self.tm.theme_name, key),
                                  bg=self.tm.theme["card"])
 
 
@@ -539,6 +542,8 @@ class ColorSensorPanel(CardPanel):
         self._cube_color = None
         self._cube_handled = False
         self._cube_ignore_logged = False
+        self._sort_lock = threading.Lock()
+        self._cube_refs = {}
         self._build_ui()
         self.register_theme()
         threading.Thread(target=self._poll_loop, daemon=True).start()
@@ -616,6 +621,23 @@ class ColorSensorPanel(CardPanel):
         ttk.Button(ctrl_row, text="Calibrate White", style="DS.TButton",
                    command=self._calibrate_white).pack(side="right")
 
+        cube_cal_row = tk.Frame(readout)
+        cube_cal_row.pack(fill="x", pady=(XS, 0))
+        self._frames.append(cube_cal_row)
+
+        ttk.Button(cube_cal_row, text="Cal Red", style="DS.TButton",
+                   command=lambda: self._calibrate_cube("RED")).pack(side="left")
+        ttk.Button(cube_cal_row, text="Cal Green", style="DS.TButton",
+                   command=lambda: self._calibrate_cube("GREEN")).pack(side="left", padx=(XS, 0))
+        ttk.Button(cube_cal_row, text="Cal Blue", style="DS.TButton",
+                   command=lambda: self._calibrate_cube("BLUE")).pack(side="left", padx=(XS, 0))
+
+        self._cube_cal_label = tk.Label(cube_cal_row, text="Cubes: not calibrated",
+                                        fg=WARNING[500], font=self.tm.font_small,
+                                        anchor="e")
+        self._cube_cal_label.pack(side="right")
+        self._frames.append(self._cube_cal_label)
+
         if HAS_MATPLOTLIB:
             # constrained layout, matching ADXL355Panel — tight_layout() bakes
             # fractional margins at the initial figsize, which left this short
@@ -681,9 +703,15 @@ class ColorSensorPanel(CardPanel):
 
     def _poll_loop(self):
         """Background thread: polls COLOR_READ at 4 Hz, forever, regardless
-        of the 'Live' checkbox, so cube detection is always active."""
+        of the 'Live' checkbox, so cube detection is always active.
+        Sorting decisions run here, not on the GUI thread."""
+        poll_timeout = min(TIMEOUT, COLOR_AUTO_REFRESH_MS / 1000.0)
         while self._poll_running:
-            resp = send_command(self.ip, "COLOR_READ")
+            resp = send_command(self.ip, "COLOR_READ", timeout=poll_timeout)
+            if resp is not None and resp.startswith("R:"):
+                parsed = self._parse_reading(resp)
+                if parsed is not None:
+                    self._check_cube_trigger(*parsed)
             try:
                 self.after(0, lambda r=resp: self._on_poll_result(r))
             except RuntimeError:
@@ -695,10 +723,6 @@ class ColorSensorPanel(CardPanel):
             return
 
         self.set_status("Reachable", "ok")
-
-        parsed = self._parse_reading(resp)
-        if parsed is not None:
-            self._check_cube_trigger(*parsed)
 
         if self.auto_refresh_var.get():
             self.log(self.board_name, f"<< {resp}")
@@ -735,10 +759,8 @@ class ColorSensorPanel(CardPanel):
 
     def _check_cube_trigger(self, r, g, b):
         """Detect a color cube under the sensor from raw RGB counts and
-        trigger the matching servo sequence. Runs on every poll."""
-        # Detection is gated on the Start Sorting button, but an in-flight servo
-        # sequence is left to finish on its own timers so a servo can't be
-        # stranded in the ON position by disarming mid-cycle.
+        trigger the matching servo sequence. Runs on the poll thread so
+        GUI-thread load (ADXL FFT, matplotlib) cannot delay decisions."""
         if not self._sorting_enabled:
             return
 
@@ -750,72 +772,98 @@ class ColorSensorPanel(CardPanel):
             self._cube_ignore_logged = False
             return
 
-        if max_val == r:
-            color = "RED"
-        elif max_val == g:
-            color = "GREEN"
+        if self._cube_refs:
+            total = r + g + b
+            if total < 1:
+                return
+            rd = (r / total, g / total, b / total)
+            best_color = None
+            best_dist = float('inf')
+            for ref_color, ref in self._cube_refs.items():
+                rt = sum(ref)
+                if rt < 1:
+                    continue
+                rn = (ref[0] / rt, ref[1] / rt, ref[2] / rt)
+                dist = sum((x - y) ** 2 for x, y in zip(rd, rn)) ** 0.5
+                if dist < best_dist:
+                    best_dist = dist
+                    best_color = ref_color
+            if best_dist > 0.3 or best_color is None:
+                self._cube_color = None
+                self._cube_handled = False
+                self._cube_ignore_logged = False
+                return
+            color = best_color
         else:
-            color = "BLUE"
+            if max_val == r:
+                color = "RED"
+            elif max_val == g:
+                color = "GREEN"
+            else:
+                color = "BLUE"
 
         if color != self._cube_color:
             self._cube_color = color
             self._cube_handled = False
             self._cube_ignore_logged = False
-            self.log(self.board_name, f"Cube detected: {color} (R={r} G={g} B={b})")
+            self.after(0, lambda c=color, rv=r, gv=g, bv=b:
+                       self.log(self.board_name,
+                                f"Cube detected: {c} (R={rv} G={gv} B={bv})"))
 
         if self._cube_handled:
             return
 
-        if self._sequence_active:
-            if not self._cube_ignore_logged:
-                self.log(self.board_name, "Sequence already active - ignoring new detection")
-                self._cube_ignore_logged = True
-            return
+        with self._sort_lock:
+            if self._sequence_active:
+                if not self._cube_ignore_logged:
+                    self.after(0, lambda: self.log(
+                        self.board_name,
+                        "Sequence already active - ignoring new detection"))
+                    self._cube_ignore_logged = True
+                return
 
-        self._cube_handled = True
+            self._cube_handled = True
 
-        if color == "RED":
-            self._start_red_sequence()
-        elif color == "GREEN":
-            self._start_green_sequence()
-        else:
-            self.log(self.board_name, "Blue cube - no servo action")
+            if color == "RED":
+                self._sequence_active = True
+                threading.Thread(
+                    target=self._run_servo_sequence,
+                    args=("RED", "SERVO1", RED_SERVO_DELAY_S,
+                          RED_SERVO_ON_DURATION_S),
+                    daemon=True).start()
+            elif color == "GREEN":
+                self._sequence_active = True
+                threading.Thread(
+                    target=self._run_servo_sequence,
+                    args=("GREEN", "SERVO2", GREEN_SERVO_DELAY_S,
+                          GREEN_SERVO_ON_DURATION_S),
+                    daemon=True).start()
+            else:
+                self.after(0, lambda: self.log(
+                    self.board_name, "Blue cube - no servo action"))
 
-    def _send_servo_command(self, cmd):
+    def _run_servo_sequence(self, color, servo, delay, duration):
+        """Background thread: timed servo ON/OFF cycle.
+        Uses time.sleep() so timing is independent of GUI-thread load."""
+        self.after(0, lambda: self.log(
+            self.board_name,
+            f"{color} cube -> {servo} ON in {delay}s, for {duration}s"))
+        time.sleep(delay)
+        self._send_servo_bg(f"{servo}_ON")
+        time.sleep(duration)
+        self._send_servo_bg(f"{servo}_OFF")
+        with self._sort_lock:
+            self._sequence_active = False
+            self._cube_ignore_logged = False
+
+    def _send_servo_bg(self, cmd):
+        """Send a servo command from a background thread."""
         if self.servo_panel is None:
-            self.log(self.board_name, f"No servo panel wired - cannot send {cmd}")
+            self.after(0, lambda: self.log(
+                self.board_name,
+                f"No servo panel wired - cannot send {cmd}"))
             return
         self.servo_panel._send(cmd)
-
-    def _start_red_sequence(self):
-        self._sequence_active = True
-        self.log(self.board_name,
-                 f"RED cube -> SERVO1 ON in {RED_SERVO_DELAY_S}s, "
-                 f"for {RED_SERVO_ON_DURATION_S}s")
-        self.after(int(RED_SERVO_DELAY_S * 1000), self._red_servo_on)
-
-    def _red_servo_on(self):
-        self._send_servo_command("SERVO1_ON")
-        self.after(int(RED_SERVO_ON_DURATION_S * 1000), self._red_servo_off)
-
-    def _red_servo_off(self):
-        self._send_servo_command("SERVO1_OFF")
-        self._sequence_active = False
-
-    def _start_green_sequence(self):
-        self._sequence_active = True
-        self.log(self.board_name,
-                 f"GREEN cube -> SERVO2 ON in {GREEN_SERVO_DELAY_S}s, "
-                 f"for {GREEN_SERVO_ON_DURATION_S}s")
-        self.after(int(GREEN_SERVO_DELAY_S * 1000), self._green_servo_on)
-
-    def _green_servo_on(self):
-        self._send_servo_command("SERVO2_ON")
-        self.after(int(GREEN_SERVO_ON_DURATION_S * 1000), self._green_servo_off)
-
-    def _green_servo_off(self):
-        self._send_servo_command("SERVO2_OFF")
-        self._sequence_active = False
 
     def _parse_reading(self, resp):
         vals = {}
@@ -894,8 +942,42 @@ class ColorSensorPanel(CardPanel):
 
     def _reset_calibration(self):
         self.cal_gains = None
+        self._cube_refs = {}
         self.cal_status_label.config(text="Not calibrated", fg=WARNING[500])
+        self._update_cube_cal_status()
         self.log(self.board_name, "Calibration reset")
+
+    def _calibrate_cube(self, color):
+        def worker():
+            resp = send_command(self.ip, "COLOR_READ")
+            self.after(0, lambda: self._on_cube_cal_response(color, resp))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_cube_cal_response(self, color, resp):
+        parsed = self._parse_reading(resp) if resp else None
+        if parsed is None:
+            self.log(self.board_name, f"{color} calibration failed - no reading")
+            return
+        r, g, b = parsed
+        if max(r, g, b) < 100:
+            self.log(self.board_name,
+                     f"Reading too low to calibrate {color} - check sensor")
+            return
+        self._cube_refs[color] = (r, g, b)
+        self.log(self.board_name,
+                 f"{color} cube calibrated: R={r} G={g} B={b}")
+        self._update_cube_cal_status()
+
+    def _update_cube_cal_status(self):
+        colors = sorted(self._cube_refs.keys())
+        if colors:
+            self._cube_cal_label.config(
+                text=f"Cubes: {', '.join(c.lower() for c in colors)}",
+                fg=SUCCESS[500])
+        else:
+            self._cube_cal_label.config(
+                text="Cubes: not calibrated",
+                fg=WARNING[500])
 
     def _update_graph(self):
         if not HAS_MATPLOTLIB or not self.time_history:
@@ -911,7 +993,7 @@ class ColorSensorPanel(CardPanel):
             v_min, v_max = min(all_vals), max(all_vals)
             margin = max(50, (v_max - v_min) * 0.2)
             self.ax.set_ylim(max(0, v_min - margin), v_max + margin)
-        self.canvas.draw()
+        self.canvas.draw_idle()
 
     def _clear_graph(self):
         for hist in self.rgb_history:
@@ -1208,9 +1290,6 @@ class SWIOT1LPanel(CardPanel):
         self.max14906 = None
         self.duty_cycle = 0.0
         self.pwm_running = False
-        self.speed_history = deque(maxlen=GRAPH_MAX_POINTS)
-        self.time_history = deque(maxlen=GRAPH_MAX_POINTS)
-        self.start_time = None
         self._build_ui()
         self.register_theme()
 
@@ -1219,13 +1298,11 @@ class SWIOT1LPanel(CardPanel):
                                                button_text="Connect",
                                                button_cmd=self._connect)
 
-        ctrl_frame = tk.LabelFrame(self.body, text="PWM Control", padx=SM, pady=SM)
-        ctrl_frame.pack(fill="x", pady=(SM, 0))
-        self._group_frames = [ctrl_frame]
-        self._frames.append(ctrl_frame)
-
-        dc_row = tk.Frame(ctrl_frame)
-        dc_row.pack(fill="x")
+        # No LabelFrame wrapper: it nested a second border inside the Card and
+        # its title only restated the card's own "Fan PWM control" subtitle,
+        # while its padding was consuming height the fan needs at minsize.
+        dc_row = tk.Frame(self.body)
+        dc_row.pack(fill="x", pady=(SM, 0))
         self._frames.append(dc_row)
 
         self.track(tk.Label(dc_row, text="Duty (%):", font=self.tm.font_ui),
@@ -1234,39 +1311,60 @@ class SWIOT1LPanel(CardPanel):
         self.dc_entry.insert(0, "0")
         self.dc_entry.pack(side="left", padx=SM)
 
-        ttk.Button(dc_row, text="Set", style="DS.TButton",
-                   command=self._set_pwm).pack(side="left")
-        ttk.Button(dc_row, text="Stop", style="DS.TButton",
-                   command=self._stop_pwm).pack(side="left", padx=(XS, 0))
+        Button(dc_row, self.tm, "Set", self._set_pwm,
+               variant="primary", height=28).pack(side="left")
+        Button(dc_row, self.tm, "Stop", self._stop_pwm,
+               variant="secondary", height=28).pack(side="left", padx=(XS, 0))
 
-        self.dc_label = tk.Label(ctrl_frame, text="0% - 0 RPM",
-                                 font=self.tm.font_mono_bold, anchor="w")
-        self.dc_label.pack(fill="x", pady=(SM, 0))
-        self.track(self.dc_label)
+        # Fan + readout. The fan shows *that* the fan is commanded on; the
+        # numbers carry the detail. See FanIndicator on why it does not spin
+        # proportionally to duty.
+        fan_row = tk.Frame(self.body)
+        fan_row.pack(fill="both", expand=True, pady=(SM, 0))
+        self._frames.append(fan_row)
 
-        if HAS_MATPLOTLIB:
-            self.fig = Figure(figsize=(3.2, 1.5), dpi=80)
-            self.ax = self.fig.add_subplot(111)
-            self.ax.set_xlabel("Time (s)", fontsize=8)
-            self.ax.set_ylabel("RPM", fontsize=8)
-            self.line, = self.ax.plot([], [], "-o", markersize=2, linewidth=1,
-                                      color=ERROR[500])
-            self.fig.tight_layout()
+        # The fan and readout pack left-to-right inside this group, and the
+        # group itself is centred in the row: expand=True hands it the spare
+        # width and fill="y" (not "both") leaves it free to sit in the middle,
+        # while still passing full height down so the glyph can size itself.
+        group = tk.Frame(fan_row)
+        group.pack(expand=True, fill="y")
+        self._frames.append(group)
 
-            self.canvas = FigureCanvasTkAgg(self.fig, master=self.body)
-            self.canvas.get_tk_widget().pack(fill="both", expand=True, pady=(SM, 0))
+        self.fan = FanIndicator(group, self.tm)
+        self.fan.pack(side="left", fill="y", padx=(0, MD))
+        self._frames.append(self.fan)
+
+        readout = tk.Frame(group)
+        readout.pack(side="left", anchor="center")
+        self._frames.append(readout)
+
+        self.duty_value = self.track(
+            tk.Label(readout, text="0%", font=self.tm.font_h1, anchor="w"))
+        self.duty_value.pack(fill="x")
+        self.track(tk.Label(readout, text="DUTY CYCLE", font=self.tm.font_small,
+                            anchor="w"), muted=True).pack(fill="x")
+        self.rpm_value = self.track(
+            tk.Label(readout, text="~0 RPM est.", font=self.tm.font_mono,
+                     anchor="w"), muted=True)
+        self.rpm_value.pack(fill="x", pady=(SM, 0))
+
+        # Motion and colour are never the only cue that the fan is running
+        # (CLAUDE.md: always pair critical icons with visible labels).
+        self.run_state = tk.Label(readout, text="STOPPED",
+                                  font=self.tm.font_small, anchor="w")
+        self.run_state.pack(fill="x", pady=(XS, 0))
 
     def apply_theme(self):
         super().apply_theme()
         t = self.tm.theme
-        for f in self._group_frames:
-            f.configure(bg=t["card"], fg=t["text2"],
-                        highlightbackground=t["border"], bd=1, relief="solid")
-
-    def style_plot(self):
-        if HAS_MATPLOTLIB:
-            self.line.set_color(ERROR[500])
-            self.theme_axes(self.fig, self.ax, self.canvas)
+        # No _group_frames loop: this panel has no LabelFrame, so every frame
+        # and label is handled by the base class via self._frames.
+        # Like status_label, this label's fg encodes state.
+        self.run_state.configure(
+            bg=t["card"],
+            fg=status_text_color(self.tm.theme_name,
+                                 "ok" if self.pwm_running else "idle"))
 
     def _connect(self):
         if not HAS_ADI and not args.demo:
@@ -1316,7 +1414,21 @@ class SWIOT1LPanel(CardPanel):
 
     def _on_connected(self):
         self.set_status("Connected", "ok")
+        self.fan.set_enabled(True)
         self.log(self.board_name, "Connected - ready for PWM")
+
+    def _set_readout(self, dc, running):
+        """Update the duty/RPM/state readout beside the fan.
+
+        The RPM figure is duty rescaled by DC_RPM, not a tachometer reading, so
+        it is labelled as an estimate.
+        """
+        self.duty_value.config(text=f"{dc:.0f}%")
+        self.rpm_value.config(text=f"~{DC_RPM * dc / 100.0:.0f} RPM est.")
+        self.run_state.config(
+            text="RUNNING" if running else "STOPPED",
+            fg=status_text_color(self.tm.theme_name,
+                                 "ok" if running else "idle"))
 
     def _on_connect_error(self, err):
         self.set_status("Error", "error")
@@ -1334,19 +1446,19 @@ class SWIOT1LPanel(CardPanel):
             return
 
         self.duty_cycle = dc
-        rpm = DC_RPM * dc / 100.0
-        self.dc_label.config(text=f"{dc:.0f}% - {rpm:.0f} RPM")
+        self._set_readout(dc, running=True)
         self.log(self.board_name, f"Duty cycle set to {dc:.0f}%")
 
         if not self.pwm_running:
             self.pwm_running = True
             threading.Thread(target=self._pwm_loop, daemon=True).start()
-            self._graph_tick()
+        self.fan.start()
 
     def _stop_pwm(self):
         self.pwm_running = False
         self.duty_cycle = 0.0
-        self.dc_label.config(text="0% - 0 RPM")
+        self.fan.stop()
+        self._set_readout(0.0, running=False)
         if self.connected and self.max14906:
             try:
                 self.max14906.channel["voltage0"].raw = 0
@@ -1374,36 +1486,9 @@ class SWIOT1LPanel(CardPanel):
             except Exception:
                 break
 
-    def _graph_tick(self):
-        if not self.pwm_running:
-            return
-        if self.start_time is None:
-            self.start_time = datetime.now()
-        elapsed = (datetime.now() - self.start_time).total_seconds()
-        rpm = DC_RPM * self.duty_cycle / 100.0
-        self.time_history.append(elapsed)
-        self.speed_history.append(rpm)
-        self._update_graph()
-        if self.pwm_running:
-            self.after(1000, self._graph_tick)
-
-    def _update_graph(self):
-        if not HAS_MATPLOTLIB or not self.speed_history:
-            return
-        times = list(self.time_history)
-        speeds = list(self.speed_history)
-        self.line.set_data(times, speeds)
-        self.ax.set_xlim(max(0, times[0] - 2), times[-1] + 2)
-        if len(speeds) > 1:
-            s_min, s_max = min(speeds), max(speeds)
-            margin = max(100, (s_max - s_min) * 0.2)
-            self.ax.set_ylim(max(0, s_min - margin), s_max + margin)
-        else:
-            self.ax.set_ylim(0, DC_RPM + 500)
-        self.canvas.draw_idle()
-
     def cleanup(self):
         self.pwm_running = False
+        self.fan.stop()
         if self.connected and self.max14906:
             try:
                 self.max14906.channel["voltage0"].raw = 0
@@ -1428,6 +1513,7 @@ class ADXL355Panel(CardPanel):
         # Cached for the app's lifetime, never written to disk. Cleared on auth
         # failure so a typo can be corrected without restarting.
         self._ssh_password = None
+        self._yield_fn = None
 
         # FFT helpers
         self._window = np.hanning(ADXL_FFT_WIN)
@@ -1518,12 +1604,28 @@ class ADXL355Panel(CardPanel):
             self.ax.set_ylabel("FFT (g)", fontsize=8)
             self.ax.set_xlim(0, ADXL_FREQ_MAX)
             self.lines = [
-                self.ax.plot([], [], lw=1, color=AXIS_COLORS[i], label=name)[0]
+                self.ax.plot([], [], lw=1, color=AXIS_COLORS[i], label=name,
+                             animated=True)[0]
                 for i, name in enumerate(AXIS_NAMES)
             ]
 
             self.canvas = FigureCanvasTkAgg(self.fig, master=self.body)
             self.canvas.get_tk_widget().pack(fill="both", expand=True, pady=(SM, 0))
+            self._bg = None
+            self.canvas.mpl_connect("draw_event", self._on_full_draw)
+
+    def _on_full_draw(self, event):
+        self._bg = self.canvas.copy_from_bbox(self.ax.bbox)
+
+    def _blit_lines(self):
+        if self._bg is None:
+            self.canvas.draw()
+        self.canvas.restore_region(self._bg)
+        for line in self.lines:
+            if line.get_visible():
+                self.ax.draw_artist(line)
+        self.canvas.blit(self.ax.bbox)
+        self.canvas.flush_events()
 
     def apply_theme(self):
         super().apply_theme()
@@ -1562,6 +1664,7 @@ class ADXL355Panel(CardPanel):
                                frameon=False)
 
         self.theme_axes(self.fig, self.ax, self.canvas)
+        self._bg = None
 
     # ------------------------------------------------------- remote servers
     def _start_servers(self):
@@ -1706,7 +1809,8 @@ class ADXL355Panel(CardPanel):
     def _schedule_update(self):
         if self._running:
             self._update()
-            self._update_id = self.after(100, self._schedule_update)
+            interval = 500 if (self._yield_fn and self._yield_fn()) else 200
+            self._update_id = self.after(interval, self._schedule_update)
 
     def _update(self):
         if not self.acq:
@@ -1748,8 +1852,12 @@ class ADXL355Panel(CardPanel):
             # autoscaling against an empty set.
             if lo is not None:
                 pad = (hi - lo) * 0.15 + 1e-6
-                self.ax.set_ylim(lo - pad, hi + pad)
-            self.canvas.draw()
+                old_lo, old_hi = self.ax.get_ylim()
+                new_lo, new_hi = lo - pad, hi + pad
+                if abs(new_lo - old_lo) > 1e-4 or abs(new_hi - old_hi) > 1e-4:
+                    self.ax.set_ylim(new_lo, new_hi)
+                    self._bg = None
+            self._blit_lines()
 
     def cleanup(self):
         self._stop()
@@ -1839,6 +1947,8 @@ class ControlPanel(tk.Tk, ThemeMixin):
                                        self._log_message, servo_panel=self.board1,
                                        shield="APARD-SPoE")
         self.board2.grid(row=0, column=1, sticky="nsew", padx=(MD // 2, 0))
+
+        self.adxl355._yield_fn = lambda: self.board2._sorting_enabled
 
         # Every middle card carries the same total padx (MD // 2) so that equal
         # columns give equal *cards*: the uniform group equalises columns, and

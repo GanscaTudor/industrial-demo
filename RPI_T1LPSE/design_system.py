@@ -17,6 +17,7 @@ Any host object passed to Button/Card as `app` must satisfy the theme contract:
 ThemeMixin below implements that contract; mix it into your application class.
 """
 
+import math
 import tkinter as tk
 import tkinter.font as tkfont
 
@@ -72,8 +73,27 @@ RADIUS = 8          # CLAUDE.md: 8px corner radius on buttons
 SEVERITY = {"success": SUCCESS[500], "warning": WARNING[500],
             "error": ERROR[500],     "info": INFO[500]}
 
+# Fills (dots, plot lines, swatches) -- the 500 shades read well at any size
+# because they cover area rather than thin glyph strokes.
 STATUS_COLOR = {"ok": SUCCESS[500], "warn": WARNING[500],
                 "error": ERROR[500], "idle": NEUTRAL[500]}
+
+# Small bold *text* needs 4.5:1 against the card it sits on, and the shade that
+# achieves that flips with the theme: SUCCESS[700] is 5.0:1 on a white card but
+# only 2.1:1 on the dark card, while SUCCESS[500] is the exact reverse. So text
+# status colours are per-theme; use status_text_color(), not STATUS_COLOR, for
+# anything rendered as type.
+STATUS_TEXT_COLOR = {
+    "light": {"ok": SUCCESS[700], "warn": WARNING[700],
+              "error": ERROR[700],  "idle": NEUTRAL[600]},
+    "dark":  {"ok": SUCCESS[500], "warn": WARNING[500],
+              "error": ERROR[500],  "idle": NEUTRAL[500]},
+}
+
+
+def status_text_color(theme_name, key):
+    """Accessible text colour for a status key under the named theme."""
+    return STATUS_TEXT_COLOR[theme_name][key]
 
 LEVEL_COLOR = {"OK": SUCCESS[500], "WARNING": WARNING[500], "ALARM": ERROR[500]}
 
@@ -255,3 +275,179 @@ class Card(tk.Frame):
     def grid_in(self, **kw): self._shadow.grid(**kw)   # grid the shadow wrapper
     def pack_in(self, **kw): self._shadow.pack(**kw)   # pack the shadow wrapper
     def outer(self):         return self._shadow
+
+
+# ---------------------------------------------------------------------------
+# FanIndicator — rotating fan glyph for commanded-state display
+# ---------------------------------------------------------------------------
+
+# Blade profile in polar form: (radius as a fraction of the rotor radius,
+# angular offset in degrees from the blade's own axis). Drawn as a smoothed
+# polygon, so these are control points rather than literal vertices -- the curve
+# runs inside them, so the extremes are pushed out further than the shape you
+# want back.
+#
+# The asymmetry is the whole point: the leading edge sweeps forward while the
+# trailing edge stays raked back, so the blade reads as an angled airfoil moving
+# in a definite direction. A profile symmetric about the blade axis renders as a
+# flower -- correct as geometry, useless as an indicator.
+_BLADE_PROFILE = [
+    (0.16,  -6),    # root, leading side
+    (0.62, -30),    # leading edge sweeping forward
+    (0.95, -26),
+    (1.00,  -4),    # tip
+    (0.92,  10),
+    (0.60,  12),    # trailing edge raked back toward the hub
+    (0.20,  20),
+]
+
+
+class FanIndicator(tk.Canvas):
+    """Rotating fan glyph: a commanded-state indicator, not a measurement.
+
+    The spin rate is deliberately fixed and unrelated to the duty cycle. Nothing
+    in this demo measures fan speed -- the RPM figure shown next to this widget
+    is duty rescaled by a constant -- so animating proportionally to it would
+    dress a typed-in number up as telemetry.
+
+    The rate is also capped well below the aliasing limit. `blades` blades give
+    the rotor a 360/blades visual period, so any frame step past half of that
+    reads as rotation the other way (the wagon-wheel effect). At the defaults
+    each frame advances 21.6 deg against a 36 deg budget.
+
+    Tk has no canvas rotation transform, so each frame recomputes blade vertices
+    and pushes them with itemcoords. Only the geometry is touched per frame;
+    colours change on the much rarer theme/state transitions via render().
+
+    The glyph is drawn to the size actually allocated, not to a fixed request:
+    it lives in a weight-shared grid cell whose height tracks the window, so a
+    hard-coded size gets clipped from the bottom when the cell is shorter than
+    the request (and the request is what winfo_height() keeps reporting, which
+    hides it from geometry assertions -- only a screenshot shows the clip).
+    `max_size` caps it so it does not balloon on a tall window.
+    """
+
+    def __init__(self, master, app, max_size=150, min_size=44, blades=5,
+                 rev_per_s=1.2, interval_ms=50):
+        # width/height are a starting request only; <Configure> takes over.
+        super().__init__(master, width=max_size, height=min_size,
+                         highlightthickness=0, bd=0)
+        self.app = app
+        self._max_size, self._min_size = max_size, min_size
+        self._size = min_size
+        self._blades = blades
+        self._interval = interval_ms
+        self._step = rev_per_s * 360.0 * interval_ms / 1000.0
+        self._phase = 0.0
+        self._running = False
+        self._enabled = False
+        self._job = None
+        self._blade_items = []
+
+        self.bind("<Configure>", self._on_configure)
+        # A pending after() would otherwise fire into a dead widget when the
+        # root window closes; panels also call stop() from their cleanup().
+        self.bind("<Destroy>", self._on_destroy)
+        app.on_theme(self.render)
+        self.render()
+
+    def _on_configure(self, event):
+        """Fit the glyph to the allocated box, clamped to [min, max]."""
+        size = max(self._min_size,
+                   min(self._max_size, event.width, event.height))
+        if size != self._size:
+            self._size = size
+            self.render()
+
+    # -- state -------------------------------------------------------------
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self.render()
+        self._tick()
+
+    def stop(self):
+        self._running = False
+        self._cancel()
+        self.render()
+
+    def set_enabled(self, enabled):
+        """Disabled means 'no board attached', which is distinct from stopped."""
+        self._enabled = enabled
+        if not enabled:
+            self._running = False
+            self._cancel()
+        self.render()
+
+    def _cancel(self):
+        if self._job is not None:
+            try:
+                self.after_cancel(self._job)
+            except (tk.TclError, ValueError):
+                pass       # interpreter already tearing down
+            self._job = None
+
+    def _on_destroy(self, _event):
+        self._running = False
+        self._cancel()
+
+    # -- animation ---------------------------------------------------------
+    def _tick(self):
+        if not self._running:
+            return
+        self._phase = (self._phase + self._step) % 360.0
+        for i, item in enumerate(self._blade_items):
+            try:
+                self.coords(item, self._blade_points(i))
+            except tk.TclError:
+                return     # widget went away mid-flight
+        self._job = self.after(self._interval, self._tick)
+
+    # -- drawing -----------------------------------------------------------
+    def _centre(self):
+        """Centre of the allocated box, which may be wider than the glyph."""
+        w = self.winfo_width()  or self._size
+        h = self.winfo_height() or self._size
+        return w / 2.0, h / 2.0
+
+    def _blade_points(self, index):
+        """Flat [x0, y0, x1, y1, ...] for blade `index` at the current phase."""
+        cx, cy = self._centre()
+        r = self._size * 0.36                  # rotor radius, inside the ring
+        base = self._phase + index * 360.0 / self._blades
+        pts = []
+        for frac, off in _BLADE_PROFILE:
+            a = math.radians(base + off)
+            pts.extend((cx + r * frac * math.cos(a),
+                        cy + r * frac * math.sin(a)))
+        return pts
+
+    def render(self):
+        t = self.app.theme
+        self.delete("all")
+        self.configure(bg=self.app.parent_bg(self))
+        self._blade_items = []
+
+        if not self._enabled:
+            accent = t["text_dis"]
+        elif self._running:
+            accent = t["primary"]
+        else:
+            accent = t["text2"]
+
+        cx, cy = self._centre()
+        ring_r = self._size * 0.46
+
+        # Housing: the fan reads as mounted hardware rather than a loose glyph.
+        self.create_oval(cx - ring_r, cy - ring_r, cx + ring_r, cy + ring_r,
+                         outline=t["border"], width=2)
+
+        for i in range(self._blades):
+            self._blade_items.append(
+                self.create_polygon(self._blade_points(i), smooth=True,
+                                    fill=accent, outline=accent, width=1))
+
+        hub_r = self._size * 0.085
+        self.create_oval(cx - hub_r, cy - hub_r, cx + hub_r, cy + hub_r,
+                         fill=t["card"], outline=accent, width=2)
