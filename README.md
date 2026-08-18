@@ -2,6 +2,49 @@
 
 Industrial control network demo using Analog Devices 10BASE-T1L Single Pair Ethernet. A Raspberry Pi running Kuiper Linux 2 acts as the central controller, communicating with multiple ADI evaluation boards over T1L to drive servomotors, control an LED, read temperatures, and drive a DC fan — all managed from a single Python GUI.
 
+## Mechanical Design
+
+<table>
+  <tr>
+    <td><img src="images/conveyor_belt_front_corner_view.png" alt="Conveyor Belt — Front Corner View" width="400"></td>
+    <td><img src="images/conveyor_belt_back_corner_view.png" alt="Conveyor Belt — Back Corner View" width="400"></td>
+  </tr>
+</table>
+
+### Bill of Materials (BOM)
+
+| Part | Description | Part No. | Qty | Vendor | Filament (g) |
+|------|-------------|----------|-----|--------|--------------|
+| Roller bearing | Deep groove ball bearing, 3×10×4 mm, double-shielded | SKF 623-2Z | 4 | [TME](https://www.tme.eu/en/details/skf623-2z/roller-bearings/skf/623-2z-skf/) | — |
+| DC gearmotor | 195:1 metal gearmotor, 20D×44L mm, 6V | Pololu 3707 | 1 | [TME](https://www.tme.eu/en/details/pololu-3707/dc-motors/pololu/195-1-metal-gearmotor-20dx44l-mm-6v-cb/) | — |
+| Color sensor | Analog color sensor (colorimeter) | DFRobot SEN0212 | 1 | [TME](https://www.tme.eu/ro/details/df-sen0212/senzori-de-mediu/dfrobot/sen0212/) | — |
+| Accelerometer eval board | Low noise, low drift 3-axis accelerometer, PMOD board | EVAL-ADXL355-PMDZ | 1 | [Analog Devices](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/eval-adxl355-pmdz.html) | — |
+| Threaded insert | Brass threaded insert for plastic parts (used with the 14 M3 screws below) | Tappex KVT-M3 (KVT-117M3) | 14 | [TME](https://www.tme.eu/ro/details/kvt-117m3/inserturi-filetate/tappex/117m3/) | — |
+| M3 screw | For the threaded inserts above | Generic M3 | 10 | — | — |
+| M3 screw | For servo / color sensor / ADXL355 holder mounting (paired with nut below) | Generic M3 | 14 | — | — |
+| M3 nut | Paired with the 14 holder-mounting screws above | Generic M3 | 14 | — | — |
+| 3D-printed parts | Chassis, holders, connectors — see [`CAD/parts`](CAD/parts/) and [`CAD/printable`](CAD/printable/) | Custom | 1 set | In-house (3D print) | ~700 (PLA or PETG) |
+
+### CAD Files
+
+CAD files are in [`CAD/`](CAD/):
+- `CAD/assembly/` — full assembly (STEP)
+- `CAD/parts/` — individual custom parts (STEP), named by part number
+- `CAD/printable/` — 3D-printable parts (3MF)
+
+### Build Steps
+
+1. 3D-print all parts.
+2. Heat-set the threaded inserts into the `side` part using a soldering iron.
+3. Assemble the side panels using the connectors and screws into the inserts.
+4. Drill holes in the side panel at the locations where the servo holder and color sensor holder will be mounted.
+5. Mount the hardware into its holders (servo into its holder, DC motor into its case, color sensor into its housing, etc.).
+6. Mount the housings with the hardware onto the side panel at the drilled holes, using M3 screws and nuts.
+7. Insert the connectors into the bearing bores and each bearing into its position. Note that one bearing uses the elongated connector, which mates with the longer connector going into the motor's connecting shaft. In this step also fit the bearings into the side panel, with the belt driveshaft connecting through the bearing.
+8. Attach the motor housing to the side panel using the heat-set inserts and M3 screws, leaving a small amount of play so the shafts self-align horizontally.
+9. Check that the overall structure is rigid and that all screws are fully tightened.
+10. Finally, position the conveyor belt and assemble it using the 3D-printed pins together with the belt.
+
 ## Hardware
 
 | Board | Description | IP Address |
