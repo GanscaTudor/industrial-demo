@@ -13,21 +13,22 @@ Industrial control network demo using Analog Devices 10BASE-T1L Single Pair Ethe
 
 ### Bill of Materials (BOM)
 
-| Part | Description | Part No. | Qty | Vendor | Filament (g) |
-|------|-------------|----------|-----|--------|--------------|
-| Roller bearing | Deep groove ball bearing, 3×10×4 mm, double-shielded | SKF 623-2Z | 4 | [TME](https://www.tme.eu/en/details/skf623-2z/roller-bearings/skf/623-2z-skf/) | — |
-| DC gearmotor | 195:1 metal gearmotor, 20D×44L mm, 6V | Pololu 3707 | 1 | [TME](https://www.tme.eu/en/details/pololu-3707/dc-motors/pololu/195-1-metal-gearmotor-20dx44l-mm-6v-cb/) | — |
-| Color sensor | Analog color sensor (colorimeter) | DFRobot SEN0212 | 1 | [TME](https://www.tme.eu/ro/details/df-sen0212/senzori-de-mediu/dfrobot/sen0212/) | — |
-| Accelerometer eval board | Low noise, low drift 3-axis accelerometer, PMOD board | EVAL-ADXL355-PMDZ | 1 | [Analog Devices](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/eval-adxl355-pmdz.html) | — |
-| Threaded insert | Brass threaded insert for plastic parts (used with the 14 M3 screws below) | Tappex KVT-M3 (KVT-117M3) | 14 | [TME](https://www.tme.eu/ro/details/kvt-117m3/inserturi-filetate/tappex/117m3/) | — |
-| M3 screw | For the threaded inserts above | Generic M3 | 10 | — | — |
-| M3 screw | For servo / color sensor / ADXL355 holder mounting (paired with nut below) | Generic M3 | 14 | — | — |
-| M3 nut | Paired with the 14 holder-mounting screws above | Generic M3 | 14 | — | — |
-| 3D-printed parts | Chassis, holders, connectors — see [`CAD/parts`](CAD/parts/) and [`CAD/printable`](CAD/printable/) | Custom | 1 set | In-house (3D print) | ~700 (PLA or PETG) |
+| Part                     | Description                                                                                          | Part No.                  | Qty   | Vendor                                                                                                                              | Filament (g)       |
+| ------------------------ | ---------------------------------------------------------------------------------------------------- | ------------------------- | ----- | ----------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| Roller bearing           | Deep groove ball bearing, 3×10×4 mm, double-shielded                                               | SKF 623-2Z                | 4     | [TME](https://www.tme.eu/en/details/skf623-2z/roller-bearings/skf/623-2z-skf/)                                                       | —                 |
+| DC gearmotor             | 195:1 metal gearmotor, 20D×44L mm, 6V                                                               | Pololu 3707               | 1     | [TME](https://www.tme.eu/en/details/pololu-3707/dc-motors/pololu/195-1-metal-gearmotor-20dx44l-mm-6v-cb/)                            | —                 |
+| Color sensor             | Analog color sensor (colorimeter)                                                                    | DFRobot SEN0212           | 1     | [TME](https://www.tme.eu/ro/details/df-sen0212/senzori-de-mediu/dfrobot/sen0212/)                                                    | —                 |
+| Accelerometer eval board | Low noise, low drift 3-axis accelerometer, PMOD board                                                | EVAL-ADXL355-PMDZ         | 1     | [Analog Devices](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/eval-adxl355-pmdz.html) | —                 |
+| Threaded insert          | Brass threaded insert for plastic parts (used with the 14 M3 screws below)                           | Tappex KVT-M3 (KVT-117M3) | 14    | [TME](https://www.tme.eu/ro/details/kvt-117m3/inserturi-filetate/tappex/117m3/)                                                      | —                 |
+| M3 screw                 | For the threaded inserts above                                                                       | Generic M3                | 10    | —                                                                                                                                  | —                 |
+| M3 screw                 | For servo / color sensor / ADXL355 holder mounting (paired with nut below)                           | Generic M3                | 14    | —                                                                                                                                  | —                 |
+| M3 nut                   | Paired with the 14 holder-mounting screws above                                                      | Generic M3                | 14    | —                                                                                                                                  | —                 |
+| 3D-printed parts         | Chassis, holders, connectors — see[`CAD/parts`](CAD/parts/) and [`CAD/printable`](CAD/printable/) | Custom                    | 1 set | In-house (3D print)                                                                                                                 | ~700 (PLA or PETG) |
 
 ### CAD Files
 
 CAD files are in [`CAD/`](CAD/):
+
 - `CAD/assembly/` — full assembly (STEP)
 - `CAD/parts/` — individual custom parts (STEP), named by part number
 - `CAD/printable/` — 3D-printable parts (3MF)
@@ -44,17 +45,18 @@ CAD files are in [`CAD/`](CAD/):
 8. Attach the motor housing to the side panel using the heat-set inserts and M3 screws, leaving a small amount of play so the shafts self-align horizontally.
 9. Check that the overall structure is rigid and that all screws are fully tightened.
 10. Finally, position the conveyor belt and assemble it using the 3D-printed pins together with the belt.
+11. *(Optional)* The `side` part and the `box` parts are designed with an internal empty cavity for embedding magnets — two 10×2 mm magnets in `side` and two 10×1 mm magnets in `box`. Mind the polarity so the two parts attract each other once assembled. To embed them, use a 3D-print slicer that supports pausing the print at a given layer/height: pause at the last layer of the cavity, place the magnet, then resume the print.
 
 ## Hardware
 
-| Board | Description | IP Address |
-|-------|------------|------------|
-| Raspberry Pi 4 + [AD-RPI-T1LPSE-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-rpi-t1lpse-sl.html) | Main controller — runs the GUI, acts as TCP client and SPoE PSE | 192.168.98.1 |
-| [AD-APARD32690-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-apard32690-sl.html) #1 + [AD-APARDPFWD-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-apardpfw-sl.html) | APARD #1 — MAX32690 MCU with ADIN2111 (dual-port T1L MAC-PHY) | 192.168.98.50 |
-| [AD-APARD32690-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-apard32690-sl.html) #2 + [AD-APARDSPOE-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-apardspoe-sl.html) | APARD #2 — MAX32690 MCU with ADIN1110 (single-port T1L MAC-PHY) | 192.168.98.60 |
-| Raspberry Pi 4 + [EVAL-CN0575-RPIZ](https://analogdevicesinc.github.io/documentation/solutions/reference-designs/eval-cn0575-rpiz/index.html) | CN0575 — ADT75 temperature sensor and ADXL355 over T1L | 192.168.10.2 |
-| [AD-T1LUSB-EBZ](https://analogdevicesinc.github.io/documentation/solutions/reference-designs/ad-apard32690-sl/ad-t1lusb-ebz/index.html) | USB-to-T1L adapter — plugged into a USB port on the main RPi | — |
-| [EVAL-AD-SWIOT1L-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-swiot1l-sl.html) | SWIOT1L — MAX14906 digital output + AD74413R analog I/O (independently powered) | 192.168.97.40 |
+| Board                                                                                                                                                                                                                                                                        | Description                                                                      | IP Address    |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- | ------------- |
+| Raspberry Pi 4 + [AD-RPI-T1LPSE-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-rpi-t1lpse-sl.html)                                                                                                                         | Main controller — runs the GUI, acts as TCP client and SPoE PSE                 | 192.168.98.1  |
+| [AD-APARD32690-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-apard32690-sl.html) #1 + [AD-APARDPFWD-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-apardpfw-sl.html)  | APARD #1 — MAX32690 MCU with ADIN2111 (dual-port T1L MAC-PHY)                    | 192.168.98.50 |
+| [AD-APARD32690-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-apard32690-sl.html) #2 + [AD-APARDSPOE-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-apardspoe-sl.html) | APARD #2 — MAX32690 MCU with ADIN1110 (single-port T1L MAC-PHY)                  | 192.168.98.60 |
+| Raspberry Pi 4 + [EVAL-CN0575-RPIZ](https://analogdevicesinc.github.io/documentation/solutions/reference-designs/eval-cn0575-rpiz/index.html)                                                                                                                                  | CN0575 — ADT75 temperature sensor and ADXL355 over T1L                          | 192.168.10.2  |
+| [AD-T1LUSB-EBZ](https://analogdevicesinc.github.io/documentation/solutions/reference-designs/ad-apard32690-sl/ad-t1lusb-ebz/index.html)                                                                                                                                       | USB-to-T1L adapter — plugged into a USB port on the main RPi                    | —            |
+| [EVAL-AD-SWIOT1L-SL](https://www.analog.com/en/resources/evaluation-hardware-and-software/evaluation-boards-kits/ad-swiot1l-sl.html)                                                                                                                                          | SWIOT1L — MAX14906 digital output + AD74413R analog I/O (independently powered) | 192.168.97.40 |
 
 ### Additional Components
 
@@ -75,12 +77,12 @@ CAD files are in [`CAD/`](CAD/):
 
 ### Operating Systems
 
-| Target | OS / Framework |
-|--------|---------------|
+| Target            | OS / Framework                                                                                      |
+| ----------------- | --------------------------------------------------------------------------------------------------- |
 | Main RPi (T1LPSE) | [ADI Kuiper Linux 2.0](https://wiki.analog.com/resources/tools-software/linux-software/kuiper-linux) |
-| CN0575 RPi | [ADI Kuiper Linux 2.0](https://wiki.analog.com/resources/tools-software/linux-software/kuiper-linux) |
-| APARD #1 and #2 | [no-OS](https://github.com/analogdevicesinc/no-OS) bare-metal C (MAX32690) |
-| SWIOT1L | [no-OS](https://github.com/analogdevicesinc/no-OS) bare-metal C (MAX32650) |
+| CN0575 RPi        | [ADI Kuiper Linux 2.0](https://wiki.analog.com/resources/tools-software/linux-software/kuiper-linux) |
+| APARD #1 and #2   | [no-OS](https://github.com/analogdevicesinc/no-OS) bare-metal C (MAX32690)                           |
+| SWIOT1L           | [no-OS](https://github.com/analogdevicesinc/no-OS) bare-metal C (MAX32650)                           |
 
 ### Python Dependencies (Main RPi)
 
@@ -200,6 +202,7 @@ git clone --recursive https://github.com/GanscaTudor/no-OS.git --branch industri
 ```
 
 This branch contains two projects used in the demo:
+
 - `projects/apardpfwd` — apard_servo_control example for APARD #1 (ADIN2111 / PFWD shield) — the firmware must expose `SERVO1_ON`, `SERVO1_OFF`, `SERVO2_ON`, `SERVO2_OFF`, `SERVO_STATUS` over TCP port 10000
 - `projects/apardspoe` — `apardspoe_led_control_example` for APARD #2 (ADIN1110 / SPOE shield)
 
@@ -272,8 +275,6 @@ sudo apt-get install -y network-manager
 Build both APARD projects. Each project's Makefile defaults to `apard_communication_example`, so override with the `EXAMPLE=` flag to build the desired example.
 
 #### APARD #1 — apard_servo_control (ADIN2111, IP 192.168.98.50)
-
-
 
 ```bash
 cd ~/no-OS/projects/apardpfwd
@@ -387,6 +388,7 @@ ping -c 3 192.168.97.40   # SWIOT1L
 On the CN0575 Raspberry Pi:
 
 Clone the demo repository:
+
 ```bash
 ssh analog@192.168.10.2
 git clone https://github.com/ganscatudor/industrial-demo
@@ -407,6 +409,7 @@ This starts a TCP server that reads the ADXL355 accelerations and temperature re
 On the main RPi:
 
 Clone the demo repository
+
 ```bash
 git clone https://github.com/ganscatudor/industrial-demo
 ```
@@ -429,17 +432,16 @@ The GUI provides:
 
 Text-based, newline-terminated. One TCP connection per command.
 
-| Command | Response | Description |
-|---------|----------|-------------|
-| `LED_ON\n` | `OK\n` | Set LED GPIO high |
-| `LED_OFF\n` | `OK\n` | Set LED GPIO low |
+| Command          | Response                      | Description            |
+| ---------------- | ----------------------------- | ---------------------- |
+| `LED_ON\n`     | `OK\n`                      | Set LED GPIO high      |
+| `LED_OFF\n`    | `OK\n`                      | Set LED GPIO low       |
 | `LED_STATUS\n` | `LED:ON\n` or `LED:OFF\n` | Read current LED state |
-
 
 ### CN0575 (TCP port 10000)
 
-| Command | Response | Description |
-|---------|----------|-------------|
+| Command         | Response        | Description                   |
+| --------------- | --------------- | ----------------------------- |
 | `READ_TEMP\n` | `TEMP:24.3\n` | Read ADT75 temperature sensor |
 
 ### SWIOT1L (pyadi-iio)
