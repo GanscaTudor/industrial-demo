@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Industrial Demo Control Panel with ADXL355 Vibration Monitor
+ADI DataX™ - AI-driven 10BASE-T1L Deployment
 (color sensor variant: COLOR_READ polled at 4 Hz over IP)
 
 Combined application integrating:
@@ -9,26 +9,42 @@ Combined application integrating:
 - SWIOT1L fan PWM control
 - ADXL355 predictive maintenance monitor
 
+Styled to the design system in CLAUDE.md (see design_system.py): approved
+palette, light/dark themes, card-based panels, 8px-radius primary buttons and
+the 4-48px spacing scale.
+
 Requirements:
     pip3 install matplotlib pyadi-iio numpy
 
 Usage:
-    python3 main_app_color4hz.py                     # real hardware
-    python3 main_app_color4hz.py --demo              # ADXL355 synthetic data
-    python3 main_app_color4hz.py --adxl-host IP      # ADXL355 server address
+    python3 main_app.py                     # real hardware, light theme
+    python3 main_app.py --theme dark        # real hardware, dark theme
+    python3 main_app.py --demo              # synthetic data for every panel
+    python3 main_app.py --adxl-host IP      # ADXL355 server address
 """
 
 import argparse
 import json
+import math
+import os
 import socket
 import struct
+import subprocess
 import threading
 import time
 from datetime import datetime
 from collections import deque
 import numpy as np
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+import tkinter.font as tkfont
+from tkinter import ttk, scrolledtext, simpledialog
+
+from design_system import (
+    PRIMARY, NEUTRAL, SUCCESS, WARNING, ERROR, INFO,
+    THEMES, XS, SM, MD, LG, XL, XXL,
+    LEVEL_COLOR, AXIS_COLORS, COLOR_AXIS_COLORS, status_text_color,
+    pick_font, Button, Card, FanIndicator, ThemeMixin,
+)
 
 try:
     from matplotlib.figure import Figure
@@ -51,7 +67,9 @@ except ImportError:
 # CLI arguments
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser()
-parser.add_argument("--demo", action="store_true", help="Use synthetic ADXL355 data")
+parser.add_argument("--demo", action="store_true",
+                    help="Synthetic data for every panel (no hardware needed)")
+parser.add_argument("--theme", choices=["light", "dark"], default="light")
 parser.add_argument("--adxl-host", type=str, default="localhost", help="ADXL355 server IP")
 parser.add_argument("--adxl-port", type=int, default=50055, help="ADXL355 server port")
 parser.add_argument("--adxl-rate", type=int, default=1000, help="ADXL355 sample rate")
@@ -67,7 +85,7 @@ APARD2_IP = "192.168.98.60"
 CN0575_IP = "192.168.10.2"
 SWIOT_IP = "192.168.97.40"
 TCP_PORT = 10000
-TIMEOUT = 5.0
+TIMEOUT = 2.0
 AUTO_REFRESH_MS = 5000
 COLOR_AUTO_REFRESH_MS = 250  # 4 reads/sec over IP for the color sensor panel
 GRAPH_MAX_POINTS = 60
@@ -81,29 +99,49 @@ ADXL_CHUNK = args.adxl_chunk
 ADXL_FREQ_MAX = min(500, ADXL_FS / 2)
 M_S2_TO_G = 1.0 / 9.80665
 
+# Remote server launch (the "Start Servers" button on the ADXL355 panel).
+# Both scripts are accept-loop servers that never return, so they must be
+# started detached and concurrently -- running them in sequence would block on
+# the first and never bind the ADXL port.
+REMOTE_HOST = f"analog@{CN0575_IP}"
+REMOTE_LOG_DIR = "/tmp"
+SSH_CONNECT_TIMEOUT = 8          # seconds; the ssh call itself returns at once
+REMOTE_SERVERS = (
+    # (label, directory, script, args, log basename)
+    ("CN0575 command server", "industrial-demo/RPI_CN0575",
+     "cn0575_state_machine.py", "", "cn0575_state_machine"),
+    ("ADXL355 data server", "vibration-demo",
+     "adxl355_server.py",
+     f"--rate {ADXL_FS} --chunk {ADXL_CHUNK} --port {args.adxl_port}",
+     "adxl355_server"),
+)
+
 # Predictive maintenance thresholds
-THRESH_WARN = 0.10
-THRESH_ALARM = 0.50
-CREST_WARN = 4.0
-KURT_WARN = 4.0
+THRESH_WARN = 2000.0
+THRESH_ALARM = 6000.0
+CREST_WARN = 6.0
+KURT_WARN = 6.0
 
 AXIS_NAMES = ["X", "Y", "Z"]
-AXIS_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c"]
-LEVEL_COLOR = {"OK": "#2ecc71", "WARNING": "#f39c12", "ALARM": "#e74c3c"}
 
 # TCS34725 color sensor settings
 COLOR_AXIS_NAMES = ["R", "G", "B"]
-COLOR_AXIS_COLORS = ["#e74c3c", "#2ecc71", "#3498db"]
+
+# AXIS_COLORS, COLOR_AXIS_COLORS and LEVEL_COLOR now come from design_system so
+# the plot series and health indicators use the CLAUDE.md palette.
 
 # Color-cube detection -> automatic servo triggering.
 # Runs continuously in the background, independent of the "Live" display checkbox.
 COLOR_CUBE_THRESHOLD = 500
 
+# Header logo target height in px (see ControlPanel._load_logo).
+LOGO_HEIGHT = 30
+
 RED_SERVO_DELAY_S = 0.0
 RED_SERVO_ON_DURATION_S = 4.0
 
-GREEN_SERVO_DELAY_S = 3.0
-GREEN_SERVO_ON_DURATION_S = 4.0
+GREEN_SERVO_DELAY_S = 3
+GREEN_SERVO_ON_DURATION_S = 3.5
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +160,76 @@ def send_command(ip, cmd, timeout=TIMEOUT):
             return data.decode("ascii").strip()
     except (socket.error, OSError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Demo mode: synthetic stand-ins for the hardware
+#
+# Every board read funnels through send_command(), so one replacement covers the
+# servo, colour and temperature panels. Response strings match the real device
+# protocol exactly, so the parsers and the cube-detection logic run unmodified.
+# ---------------------------------------------------------------------------
+_demo_t0 = None
+
+
+def _demo_elapsed():
+    global _demo_t0
+    if _demo_t0 is None:
+        _demo_t0 = time.monotonic()
+    return time.monotonic() - _demo_t0
+
+
+def demo_send_command(ip, cmd, timeout=TIMEOUT):
+    """Protocol-accurate synthetic replies. Mirrors send_command's contract."""
+    elapsed = _demo_elapsed()
+
+    if cmd == "SERVO_STATUS":
+        return "SERVO1:OFF,SERVO2:OFF"
+    if cmd in ("SERVO1_ON", "SERVO1_OFF", "SERVO2_ON", "SERVO2_OFF"):
+        return "OK"
+
+    if cmd == "COLOR_READ":
+        # 30 s loop: neutral -> red cube -> neutral -> green cube -> neutral.
+        # Cube phases exceed COLOR_CUBE_THRESHOLD so _check_cube_trigger fires
+        # the servo sequences; neutral phases stay well below it.
+        t = elapsed % 30.0
+        if 8.0 <= t < 12.0:
+            r, g, b = 1800, 310, 290          # RED  -> SERVO1 sequence
+        elif 20.0 <= t < 24.0:
+            r, g, b = 280, 1600, 310          # GREEN -> SERVO2 sequence
+        else:
+            r = int(120 + 20 * math.sin(elapsed * 0.30))
+            g = int(120 + 15 * math.sin(elapsed * 0.20 + 1.0))
+            b = int(120 + 18 * math.sin(elapsed * 0.25 + 2.0))
+        return f"R:{r},G:{g},B:{b}"
+
+    if cmd == "READ_TEMP":
+        return f"TEMP:{22.0 + 3.0 * math.sin(elapsed * 0.05):.1f}"
+
+    return None
+
+
+class _DemoChannel:
+    """Stands in for max14906.channel['voltageN'] — accepts .raw writes."""
+    raw = 0
+
+
+class _DemoADIDevice:
+    """Accepts the attribute writes the SWIOT1L panel performs on real devices."""
+
+    def __init__(self, *_args, **_kwargs):
+        self.channel = {f"voltage{i}": _DemoChannel() for i in range(4)}
+        self.mode = "config"
+
+    def __setattr__(self, name, value):
+        object.__setattr__(self, name, value)
+
+    def __getattr__(self, name):
+        return 0
+
+
+if args.demo:
+    send_command = demo_send_command
 
 
 # ---------------------------------------------------------------------------
@@ -238,9 +346,11 @@ def compute_metrics(samples):
 
 def health_level(rms, cf, kurt):
     """Determine health status from metrics."""
+    if rms < THRESH_WARN:
+        return "OK"
     if rms >= THRESH_ALARM or cf >= CREST_WARN * 1.5 or kurt >= KURT_WARN * 2:
         return "ALARM"
-    if rms >= THRESH_WARN or cf >= CREST_WARN or kurt >= KURT_WARN:
+    if cf >= CREST_WARN or kurt >= KURT_WARN:
         return "WARNING"
     return "OK"
 
@@ -248,6 +358,138 @@ def health_level(rms, cf, kurt):
 # ---------------------------------------------------------------------------
 # UI Panels
 # ---------------------------------------------------------------------------
+class CardPanel(tk.Frame):
+    """Base for every hardware panel: a themed Card with a title and a
+    status row.
+
+    Panels are plain tk.Frame (not ttk.LabelFrame) because ttk widgets ignore
+    bg=/fg= and a LabelFrame's built-in title is only reachable through the
+    global TLabelframe.Label style, which cannot be re-themed per panel at
+    runtime. The Card supplies the border/shadow/padding from CLAUDE.md and the
+    title becomes a real tk.Label we can recolour directly.
+    """
+
+    def __init__(self, parent, tm, title, subtitle=""):
+        super().__init__(parent)
+        self.tm = tm
+        self._card = Card(self, tm, pad=MD)
+        self._card.outer().pack(fill=tk.BOTH, expand=True)
+        self.body = self._card.body
+
+        self._title_lbl = tk.Label(self.body, text=title, anchor="w",
+                                   font=tm.font_h2)
+        self._title_lbl.pack(fill="x")
+        self._subtitle_lbl = None
+        if subtitle:
+            self._subtitle_lbl = tk.Label(self.body, text=subtitle, anchor="w",
+                                          font=tm.font_small)
+            self._subtitle_lbl.pack(fill="x", pady=(0, SM))
+        else:
+            self._title_lbl.pack_configure(pady=(0, SM))
+
+        # Widgets whose colours track the theme, registered by subclasses.
+        self._plain_labels = []      # follow text/card
+        self._muted_labels = []      # follow text2/card
+        self._frames = []            # follow card bg
+
+    # -- theme plumbing ----------------------------------------------------
+    def register_theme(self):
+        """Call at the end of __init__, once the UI exists."""
+        self.tm.on_theme(self.apply_theme)
+
+    def track(self, *widgets, muted=False):
+        """Mark labels/frames to be recoloured on every theme switch.
+
+        Always returns the first widget so it can be chained:
+            self.track(tk.Label(...)).pack(...)
+        """
+        for w in widgets:
+            if isinstance(w, tk.Label):
+                (self._muted_labels if muted else self._plain_labels).append(w)
+            else:
+                self._frames.append(w)
+        return widgets[0]
+
+    def apply_theme(self):
+        t = self.tm.theme
+        self.configure(bg=t["bg"])
+        self._title_lbl.configure(bg=t["card"], fg=t["text"])
+        if self._subtitle_lbl is not None:
+            self._subtitle_lbl.configure(bg=t["card"], fg=t["text_dis"])
+        for w in self._frames:
+            try:
+                w.configure(bg=t["card"])
+            except tk.TclError:
+                pass
+        for w in self._plain_labels:
+            w.configure(bg=t["card"], fg=t["text"])
+        for w in self._muted_labels:
+            w.configure(bg=t["card"], fg=t["text2"])
+        # The status label's fg encodes state, but the accessible shade for that
+        # state differs per theme, so it is re-resolved here rather than fixed.
+        if getattr(self, "status_label", None) is not None:
+            self.status_label.configure(
+                bg=t["card"],
+                fg=status_text_color(self.tm.theme_name, self._status_key))
+        self.style_plot()
+
+    def style_plot(self):
+        """Overridden by panels that embed a matplotlib figure."""
+
+    def theme_axes(self, fig, ax, canvas):
+        """Apply the CLAUDE.md palette to an embedded matplotlib axes."""
+        t = self.tm.theme
+        fig.patch.set_facecolor(t["card"])
+        ax.set_facecolor(t["card"])
+        ax.tick_params(colors=t["text2"], labelsize=7)
+        for sp in ax.spines.values():
+            sp.set_color(t["border"])
+        ax.grid(True, color=t["border"], lw=0.5, alpha=0.6)
+        ax.xaxis.label.set_color(t["text2"])
+        ax.yaxis.label.set_color(t["text2"])
+        ax.title.set_color(t["text"])
+        leg = ax.get_legend()
+        if leg is not None:
+            for txt in leg.get_texts():
+                txt.set_color(t["text2"])
+        canvas.get_tk_widget().configure(bg=t["card"], highlightthickness=0)
+        canvas.draw_idle()
+
+    def status_row(self, label_text="Status:", value="Unknown",
+                   button_text=None, button_cmd=None):
+        """Build the shared 'Status: <value>  [Action]' row.
+
+        The value is a tk.Label (not ttk) because its foreground carries state
+        and a named ttk style would override per-widget colours.
+        """
+        row = tk.Frame(self.body)
+        row.pack(fill="x", pady=(0, SM))
+        self._frames.append(row)
+        cap = tk.Label(row, text=label_text, font=self.tm.font_small)
+        cap.pack(side="left")
+        self._muted_labels.append(cap)
+        self.status_label = tk.Label(row, text=value, font=self.tm.font_bold)
+        self.status_label.pack(side="left", padx=(XS, 0))
+        self._status_key = "idle"
+        btn = None
+        if button_text:
+            btn = Button(row, self.tm, button_text, button_cmd,
+                         variant="primary", height=28)
+            btn.pack(side="right")
+        return row, btn
+
+    def set_status(self, text, key):
+        """Set the status text and its semantic colour together.
+
+        CLAUDE.md: colour is never the only indicator, so the wording changes
+        alongside the colour.
+        """
+        self._status_key = key
+        self.status_label.config(text=text,
+                                 fg=status_text_color(self.tm.theme_name, key),
+                                 bg=self.tm.theme["card"])
+
+
 def rgb_counts_to_hex(r, g, b):
     """Normalize raw 16-bit ADC counts to a displayable sRGB swatch color."""
     peak = max(r, g, b, 1)
@@ -258,7 +500,7 @@ def rgb_counts_to_hex(r, g, b):
     return f"#{rr:02x}{gg:02x}{bb:02x}"
 
 
-class ColorSensorPanel(ttk.LabelFrame):
+class ColorSensorPanel(CardPanel):
     """UI panel for an APARD board with a TCS34725 color sensor.
 
     A background thread continuously polls COLOR_READ over IP at
@@ -268,8 +510,14 @@ class ColorSensorPanel(ttk.LabelFrame):
     the swatch/labels/graph.
     """
 
-    def __init__(self, parent, board_name, ip, log_callback, servo_panel=None):
-        super().__init__(parent, text=f"  {board_name} ({ip})  ", padding=10)
+    def __init__(self, parent, tm, board_name, ip, log_callback, servo_panel=None,
+                 shield=""):
+        # The shield goes in the subtitle, not the title: board_name doubles as
+        # the log-line prefix (see ControlPanel._log_message), so a long title
+        # would push every other panel's log lines out of alignment.
+        subtitle = " · ".join(p for p in (f"{shield} shield" if shield else "",
+                                          "TCS34725 colour sensor", ip) if p)
+        super().__init__(parent, tm, board_name, subtitle)
         self.board_name = board_name
         self.ip = ip
         self.log = log_callback
@@ -281,6 +529,10 @@ class ColorSensorPanel(ttk.LabelFrame):
         self.auto_refresh_var = tk.BooleanVar(value=False)
         self._poll_running = True
         self._sequence_active = False
+        # Gates cube detection -> servo actuation. Polling and the readout run
+        # regardless; this only decides whether a detected cube is acted on, so
+        # the sensor can be watched and calibrated before the line is armed.
+        self._sorting_enabled = False
         # Tracks the color of whatever cube is currently sitting under the
         # sensor (None if nothing above threshold), plus whether that
         # specific physical cube has already been acted on / had its
@@ -290,80 +542,131 @@ class ColorSensorPanel(ttk.LabelFrame):
         self._cube_color = None
         self._cube_handled = False
         self._cube_ignore_logged = False
+        self._sort_lock = threading.Lock()
+        self._cube_refs = {}
         self._build_ui()
+        self.register_theme()
         threading.Thread(target=self._poll_loop, daemon=True).start()
 
     def _build_ui(self):
-        status_frame = ttk.Frame(self)
-        status_frame.pack(fill="x", pady=(0, 8))
+        row, _ = self.status_row(button_text="Test", button_cmd=self._test_connection)
 
-        ttk.Label(status_frame, text="Status:").pack(side="left")
-        self.status_label = ttk.Label(
-            status_frame, text="Unknown", foreground="gray",
-            font=("TkDefaultFont", 10, "bold")
-        )
-        self.status_label.pack(side="left", padx=6)
-        ttk.Button(status_frame, text="Test", command=self._test_connection).pack(side="right")
+        # Packed side="right" after Test, so it lands left of it.
+        # min_width keeps the card from reflowing when the label changes length.
+        self._btn_sort = Button(row, self.tm, "Start Sorting", self._toggle_sorting,
+                                variant="primary", height=28, min_width=110)
+        self._btn_sort.pack(side="right", padx=(0, XS))
 
-        color_frame = ttk.LabelFrame(self, text="Color Sensor", padding=6)
-        color_frame.pack(fill="x", pady=4)
+        # Colour is never the only indicator (CLAUDE.md): the wording carries the
+        # state too, for the same reason set_status() changes both.
+        self.sort_status_label = tk.Label(self.body, text="Sorting stopped",
+                                          fg=NEUTRAL[500], font=self.tm.font_small,
+                                          anchor="w")
+        self.sort_status_label.pack(fill="x")
+        self._frames.append(self.sort_status_label)   # bg only; fg carries state
 
-        swatch_row = ttk.Frame(color_frame)
+        # No LabelFrame wrapper here (unlike the other panels): its title would
+        # only repeat the card's own subtitle, and the border plus its internal
+        # padding cost ~40px of height that the graph below needs more.
+        readout = tk.Frame(self.body)
+        readout.pack(fill="x", pady=(SM, 0))
+        self._frames.append(readout)
+
+        swatch_row = tk.Frame(readout)
         swatch_row.pack(fill="x")
+        self._frames.append(swatch_row)
 
-        self.swatch = tk.Canvas(swatch_row, width=80, height=50, bg="#000000",
-                                 highlightthickness=1, highlightbackground="#888")
-        self.swatch.pack(side="left", padx=(0, 8))
-        self.swatch_rect = self.swatch.create_rectangle(0, 0, 80, 50, fill="#000000", outline="")
+        self.swatch = tk.Canvas(swatch_row, width=60, height=38, bg=NEUTRAL[950],
+                                highlightthickness=1)
+        self.swatch.pack(side="left", padx=(0, SM))
+        self.swatch_rect = self.swatch.create_rectangle(0, 0, 60, 38,
+                                                        fill=NEUTRAL[950], outline="")
 
-        info_col = ttk.Frame(swatch_row)
+        # Packed before info_col so the expanding value column takes the slack
+        # between the swatch and this label rather than pushing it off-panel.
+        # Colour is paired with wording, per CLAUDE.md.
+        self.cal_status_label = tk.Label(swatch_row, text="Not calibrated",
+                                        fg=WARNING[500], font=self.tm.font_small,
+                                        anchor="e")
+        self.cal_status_label.pack(side="right", padx=(SM, 0))
+        self._frames.append(self.cal_status_label)   # bg only; fg carries state
+
+        info_col = tk.Frame(swatch_row)
         info_col.pack(side="left", fill="both", expand=True)
+        self._frames.append(info_col)
 
-        self.rgb_label = ttk.Label(info_col, text="R: -   G: -   B: -",
-                                    font=("Courier", 10, "bold"))
-        self.rgb_label.pack(anchor="w")
-        self.hex_label = ttk.Label(info_col, text="#------", font=("Courier", 9))
-        self.hex_label.pack(anchor="w")
+        self.rgb_label = tk.Label(info_col, text="R: -   G: -   B: -",
+                                  font=self.tm.font_mono_bold, anchor="w")
+        self.rgb_label.pack(fill="x")
+        self.hex_label = tk.Label(info_col, text="#------",
+                                  font=self.tm.font_mono, anchor="w")
+        self.hex_label.pack(fill="x")
+        self.track(self.rgb_label)
+        self.track(self.hex_label, muted=True)
 
-        ctrl_row = ttk.Frame(color_frame)
-        ctrl_row.pack(fill="x", pady=(6, 0))
+        # One control row, not two: frequent actions left, occasional right.
+        ctrl_row = tk.Frame(readout)
+        ctrl_row.pack(fill="x", pady=(SM, 0))
+        self._frames.append(ctrl_row)
 
-        ttk.Button(ctrl_row, text="Read Color", command=self._read_color).pack(side="left", padx=2)
-        ttk.Checkbutton(
-            ctrl_row, text="Live (4Hz)",
-            variable=self.auto_refresh_var,
-            command=self._toggle_auto_refresh
-        ).pack(side="left", padx=10)
-        ttk.Button(ctrl_row, text="Clear", command=self._clear_graph).pack(side="right", padx=2)
+        ttk.Button(ctrl_row, text="Read Color", style="DS.TButton",
+                   command=self._read_color).pack(side="left")
+        ttk.Checkbutton(ctrl_row, text="Live (4Hz)", style="DS.TCheckbutton",
+                        variable=self.auto_refresh_var,
+                        command=self._toggle_auto_refresh).pack(side="left", padx=SM)
+        ttk.Button(ctrl_row, text="Clear", style="DS.TButton",
+                   command=self._clear_graph).pack(side="right")
+        ttk.Button(ctrl_row, text="Reset Cal", style="DS.TButton",
+                   command=self._reset_calibration).pack(side="right", padx=(XS, SM))
+        ttk.Button(ctrl_row, text="Calibrate White", style="DS.TButton",
+                   command=self._calibrate_white).pack(side="right")
 
-        cal_row = ttk.Frame(color_frame)
-        cal_row.pack(fill="x", pady=(6, 0))
+        cube_cal_row = tk.Frame(readout)
+        cube_cal_row.pack(fill="x", pady=(XS, 0))
+        self._frames.append(cube_cal_row)
 
-        ttk.Button(cal_row, text="Calibrate White", command=self._calibrate_white).pack(side="left", padx=2)
-        ttk.Button(cal_row, text="Reset Cal", command=self._reset_calibration).pack(side="left", padx=2)
+        ttk.Button(cube_cal_row, text="Cal Red", style="DS.TButton",
+                   command=lambda: self._calibrate_cube("RED")).pack(side="left")
+        ttk.Button(cube_cal_row, text="Cal Green", style="DS.TButton",
+                   command=lambda: self._calibrate_cube("GREEN")).pack(side="left", padx=(XS, 0))
+        ttk.Button(cube_cal_row, text="Cal Blue", style="DS.TButton",
+                   command=lambda: self._calibrate_cube("BLUE")).pack(side="left", padx=(XS, 0))
 
-        self.cal_status_label = ttk.Label(color_frame, text="Not calibrated", foreground="#f39c12",
-                                           font=("TkDefaultFont", 9, "bold"))
-        self.cal_status_label.pack(pady=(4, 0))
+        self._cube_cal_label = tk.Label(cube_cal_row, text="Cubes: not calibrated",
+                                        fg=WARNING[500], font=self.tm.font_small,
+                                        anchor="e")
+        self._cube_cal_label.pack(side="right")
+        self._frames.append(self._cube_cal_label)
 
         if HAS_MATPLOTLIB:
-            self.fig = Figure(figsize=(4, 2), dpi=80)
-            self.fig.patch.set_facecolor("#f0f0f0")
+            # constrained layout, matching ADXL355Panel — tight_layout() bakes
+            # fractional margins at the initial figsize, which left this short
+            # figure mostly dead space once the card grew.
+            self.fig = Figure(figsize=(3.2, 2.4), dpi=80, layout="constrained")
             self.ax = self.fig.add_subplot(111)
             self.ax.set_xlabel("Time (s)", fontsize=8)
             self.ax.set_ylabel("Count", fontsize=8)
-            self.ax.tick_params(labelsize=7)
-            self.ax.grid(True, alpha=0.3)
             self.lines = [
                 self.ax.plot([], [], "-o", markersize=2, linewidth=1,
                              color=COLOR_AXIS_COLORS[i], label=COLOR_AXIS_NAMES[i])[0]
                 for i in range(3)
             ]
-            self.ax.legend(fontsize=7, loc="upper left")
-            self.fig.tight_layout()
+            self.ax.legend(fontsize=7, loc="upper left", frameon=False)
 
-            self.canvas = FigureCanvasTkAgg(self.fig, master=self)
-            self.canvas.get_tk_widget().pack(fill="both", expand=True, pady=(4, 0))
+            self.canvas = FigureCanvasTkAgg(self.fig, master=self.body)
+            self.canvas.get_tk_widget().pack(fill="both", expand=True, pady=(SM, 0))
+
+    def apply_theme(self):
+        super().apply_theme()
+        # No _group_frames loop: this panel has no LabelFrame, so every frame
+        # and label is handled by the base class via self._frames.
+        self.swatch.configure(highlightbackground=self.tm.theme["border"])
+
+    def style_plot(self):
+        if HAS_MATPLOTLIB:
+            for i, line in enumerate(self.lines):
+                line.set_color(COLOR_AXIS_COLORS[i])
+            self.theme_axes(self.fig, self.ax, self.canvas)
 
     def _test_connection(self):
         def worker():
@@ -373,11 +676,11 @@ class ColorSensorPanel(ttk.LabelFrame):
 
     def _on_test_result(self, resp):
         if resp is not None and resp.startswith("R:"):
-            self.status_label.config(text="Reachable", foreground="green")
+            self.set_status("Reachable", "ok")
             self.log(self.board_name, f"Board reachable - {resp}")
             self._apply_reading(resp, record=False)
         else:
-            self.status_label.config(text="Unreachable", foreground="red")
+            self.set_status("Unreachable", "error")
             self.log(self.board_name, f"Cannot reach {self.ip}")
 
     def _read_color(self):
@@ -393,38 +696,74 @@ class ColorSensorPanel(ttk.LabelFrame):
     def _on_color_response(self, resp):
         self.log(self.board_name, f"<< {resp}")
         if resp.startswith("R:"):
-            self.status_label.config(text="Reachable", foreground="green")
+            self.set_status("Reachable", "ok")
             self._apply_reading(resp, record=True)
         else:
-            self.status_label.config(text="Unreachable", foreground="red")
+            self.set_status("Unreachable", "error")
 
     def _poll_loop(self):
         """Background thread: polls COLOR_READ at 4 Hz, forever, regardless
-        of the 'Live' checkbox, so cube detection is always active."""
+        of the 'Live' checkbox, so cube detection is always active.
+        Sorting decisions run here, not on the GUI thread."""
+        poll_timeout = min(TIMEOUT, COLOR_AUTO_REFRESH_MS / 1000.0)
         while self._poll_running:
-            resp = send_command(self.ip, "COLOR_READ")
-            self.after(0, lambda r=resp: self._on_poll_result(r))
+            resp = send_command(self.ip, "COLOR_READ", timeout=poll_timeout)
+            if resp is not None and resp.startswith("R:"):
+                parsed = self._parse_reading(resp)
+                if parsed is not None:
+                    self._check_cube_trigger(*parsed)
+            try:
+                self.after(0, lambda r=resp: self._on_poll_result(r))
+            except RuntimeError:
+                pass
             time.sleep(COLOR_AUTO_REFRESH_MS / 1000.0)
 
     def _on_poll_result(self, resp):
         if resp is None or not resp.startswith("R:"):
-            if self.auto_refresh_var.get():
-                self.status_label.config(text="Unreachable", foreground="red")
             return
 
-        self.status_label.config(text="Reachable", foreground="green")
-
-        parsed = self._parse_reading(resp)
-        if parsed is not None:
-            self._check_cube_trigger(*parsed)
+        self.set_status("Reachable", "ok")
 
         if self.auto_refresh_var.get():
             self.log(self.board_name, f"<< {resp}")
             self._apply_reading(resp, record=True)
 
+    def _toggle_sorting(self):
+        """Arm or disarm cube detection -> servo actuation."""
+        if self._sorting_enabled:
+            self._stop_sorting()
+        else:
+            self._start_sorting()
+
+    def _start_sorting(self):
+        self._sorting_enabled = True
+        # Clear the latch so a cube already sitting under the sensor when the
+        # line is armed is picked up on the next poll rather than being treated
+        # as already-handled.
+        self._cube_color = None
+        self._cube_handled = False
+        self._cube_ignore_logged = False
+        self._btn_sort.label = "Stop Sorting"
+        self._btn_sort.variant = "secondary"
+        self._btn_sort.render()
+        self.sort_status_label.config(text="Sorting running", fg=SUCCESS[500])
+        self.log(self.board_name, "Sorting started - cube detection armed")
+
+    def _stop_sorting(self):
+        self._sorting_enabled = False
+        self._btn_sort.label = "Start Sorting"
+        self._btn_sort.variant = "primary"
+        self._btn_sort.render()
+        self.sort_status_label.config(text="Sorting stopped", fg=NEUTRAL[500])
+        self.log(self.board_name, "Sorting stopped - cube detection disarmed")
+
     def _check_cube_trigger(self, r, g, b):
         """Detect a color cube under the sensor from raw RGB counts and
-        trigger the matching servo sequence. Runs on every poll."""
+        trigger the matching servo sequence. Runs on the poll thread so
+        GUI-thread load (ADXL FFT, matplotlib) cannot delay decisions."""
+        if not self._sorting_enabled:
+            return
+
         max_val = max(r, g, b)
 
         if max_val < COLOR_CUBE_THRESHOLD:
@@ -433,72 +772,98 @@ class ColorSensorPanel(ttk.LabelFrame):
             self._cube_ignore_logged = False
             return
 
-        if max_val == r:
-            color = "RED"
-        elif max_val == g:
-            color = "GREEN"
+        if self._cube_refs:
+            total = r + g + b
+            if total < 1:
+                return
+            rd = (r / total, g / total, b / total)
+            best_color = None
+            best_dist = float('inf')
+            for ref_color, ref in self._cube_refs.items():
+                rt = sum(ref)
+                if rt < 1:
+                    continue
+                rn = (ref[0] / rt, ref[1] / rt, ref[2] / rt)
+                dist = sum((x - y) ** 2 for x, y in zip(rd, rn)) ** 0.5
+                if dist < best_dist:
+                    best_dist = dist
+                    best_color = ref_color
+            if best_dist > 0.3 or best_color is None:
+                self._cube_color = None
+                self._cube_handled = False
+                self._cube_ignore_logged = False
+                return
+            color = best_color
         else:
-            color = "BLUE"
+            if max_val == r:
+                color = "RED"
+            elif max_val == g:
+                color = "GREEN"
+            else:
+                color = "BLUE"
 
         if color != self._cube_color:
             self._cube_color = color
             self._cube_handled = False
             self._cube_ignore_logged = False
-            self.log(self.board_name, f"Cube detected: {color} (R={r} G={g} B={b})")
+            self.after(0, lambda c=color, rv=r, gv=g, bv=b:
+                       self.log(self.board_name,
+                                f"Cube detected: {c} (R={rv} G={gv} B={bv})"))
 
         if self._cube_handled:
             return
 
-        if self._sequence_active:
-            if not self._cube_ignore_logged:
-                self.log(self.board_name, "Sequence already active - ignoring new detection")
-                self._cube_ignore_logged = True
-            return
+        with self._sort_lock:
+            if self._sequence_active:
+                if not self._cube_ignore_logged:
+                    self.after(0, lambda: self.log(
+                        self.board_name,
+                        "Sequence already active - ignoring new detection"))
+                    self._cube_ignore_logged = True
+                return
 
-        self._cube_handled = True
+            self._cube_handled = True
 
-        if color == "RED":
-            self._start_red_sequence()
-        elif color == "GREEN":
-            self._start_green_sequence()
-        else:
-            self.log(self.board_name, "Blue cube - no servo action")
+            if color == "RED":
+                self._sequence_active = True
+                threading.Thread(
+                    target=self._run_servo_sequence,
+                    args=("RED", "SERVO1", RED_SERVO_DELAY_S,
+                          RED_SERVO_ON_DURATION_S),
+                    daemon=True).start()
+            elif color == "GREEN":
+                self._sequence_active = True
+                threading.Thread(
+                    target=self._run_servo_sequence,
+                    args=("GREEN", "SERVO2", GREEN_SERVO_DELAY_S,
+                          GREEN_SERVO_ON_DURATION_S),
+                    daemon=True).start()
+            else:
+                self.after(0, lambda: self.log(
+                    self.board_name, "Blue cube - no servo action"))
 
-    def _send_servo_command(self, cmd):
+    def _run_servo_sequence(self, color, servo, delay, duration):
+        """Background thread: timed servo ON/OFF cycle.
+        Uses time.sleep() so timing is independent of GUI-thread load."""
+        self.after(0, lambda: self.log(
+            self.board_name,
+            f"{color} cube -> {servo} ON in {delay}s, for {duration}s"))
+        time.sleep(delay)
+        self._send_servo_bg(f"{servo}_ON")
+        time.sleep(duration)
+        self._send_servo_bg(f"{servo}_OFF")
+        with self._sort_lock:
+            self._sequence_active = False
+            self._cube_ignore_logged = False
+
+    def _send_servo_bg(self, cmd):
+        """Send a servo command from a background thread."""
         if self.servo_panel is None:
-            self.log(self.board_name, f"No servo panel wired - cannot send {cmd}")
+            self.after(0, lambda: self.log(
+                self.board_name,
+                f"No servo panel wired - cannot send {cmd}"))
             return
         self.servo_panel._send(cmd)
-
-    def _start_red_sequence(self):
-        self._sequence_active = True
-        self.log(self.board_name,
-                 f"RED cube -> SERVO1 ON in {RED_SERVO_DELAY_S}s, "
-                 f"for {RED_SERVO_ON_DURATION_S}s")
-        self.after(int(RED_SERVO_DELAY_S * 1000), self._red_servo_on)
-
-    def _red_servo_on(self):
-        self._send_servo_command("SERVO1_ON")
-        self.after(int(RED_SERVO_ON_DURATION_S * 1000), self._red_servo_off)
-
-    def _red_servo_off(self):
-        self._send_servo_command("SERVO1_OFF")
-        self._sequence_active = False
-
-    def _start_green_sequence(self):
-        self._sequence_active = True
-        self.log(self.board_name,
-                 f"GREEN cube -> SERVO2 ON in {GREEN_SERVO_DELAY_S}s, "
-                 f"for {GREEN_SERVO_ON_DURATION_S}s")
-        self.after(int(GREEN_SERVO_DELAY_S * 1000), self._green_servo_on)
-
-    def _green_servo_on(self):
-        self._send_servo_command("SERVO2_ON")
-        self.after(int(GREEN_SERVO_ON_DURATION_S * 1000), self._green_servo_off)
-
-    def _green_servo_off(self):
-        self._send_servo_command("SERVO2_OFF")
-        self._sequence_active = False
 
     def _parse_reading(self, resp):
         vals = {}
@@ -543,7 +908,7 @@ class ColorSensorPanel(ttk.LabelFrame):
 
     def _on_error(self):
         self.log(self.board_name, "<< ERROR: no response")
-        self.status_label.config(text="Unreachable", foreground="red")
+        self.set_status("Unreachable", "error")
 
     def _calibrate_white(self):
         def worker():
@@ -569,7 +934,7 @@ class ColorSensorPanel(ttk.LabelFrame):
             target / max(ref_g, 1),
             target / max(ref_b, 1),
         )
-        self.cal_status_label.config(text="Calibrated", foreground="#2ecc71")
+        self.cal_status_label.config(text="Calibrated", fg=SUCCESS[500])
         self.log(self.board_name,
                  f"White calibration set from R={ref_r} G={ref_g} B={ref_b} "
                  f"(gains: {self.cal_gains[0]:.2f}, {self.cal_gains[1]:.2f}, "
@@ -577,8 +942,42 @@ class ColorSensorPanel(ttk.LabelFrame):
 
     def _reset_calibration(self):
         self.cal_gains = None
-        self.cal_status_label.config(text="Not calibrated", foreground="#f39c12")
+        self._cube_refs = {}
+        self.cal_status_label.config(text="Not calibrated", fg=WARNING[500])
+        self._update_cube_cal_status()
         self.log(self.board_name, "Calibration reset")
+
+    def _calibrate_cube(self, color):
+        def worker():
+            resp = send_command(self.ip, "COLOR_READ")
+            self.after(0, lambda: self._on_cube_cal_response(color, resp))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_cube_cal_response(self, color, resp):
+        parsed = self._parse_reading(resp) if resp else None
+        if parsed is None:
+            self.log(self.board_name, f"{color} calibration failed - no reading")
+            return
+        r, g, b = parsed
+        if max(r, g, b) < 100:
+            self.log(self.board_name,
+                     f"Reading too low to calibrate {color} - check sensor")
+            return
+        self._cube_refs[color] = (r, g, b)
+        self.log(self.board_name,
+                 f"{color} cube calibrated: R={r} G={g} B={b}")
+        self._update_cube_cal_status()
+
+    def _update_cube_cal_status(self):
+        colors = sorted(self._cube_refs.keys())
+        if colors:
+            self._cube_cal_label.config(
+                text=f"Cubes: {', '.join(c.lower() for c in colors)}",
+                fg=SUCCESS[500])
+        else:
+            self._cube_cal_label.config(
+                text="Cubes: not calibrated",
+                fg=WARNING[500])
 
     def _update_graph(self):
         if not HAS_MATPLOTLIB or not self.time_history:
@@ -606,7 +1005,7 @@ class ColorSensorPanel(ttk.LabelFrame):
                 line.set_data([], [])
             self.ax.set_xlim(0, 10)
             self.ax.set_ylim(0, 100)
-            self.canvas.draw_idle()
+            self.canvas.draw()
 
     def _toggle_auto_refresh(self):
         # Background polling (_poll_loop) always runs; this only controls
@@ -618,56 +1017,65 @@ class ColorSensorPanel(ttk.LabelFrame):
         self._poll_running = False
 
 
-class ServoBoardPanel(ttk.LabelFrame):
+class ServoBoardPanel(CardPanel):
     """UI panel for an APARD board driving two servomotors."""
 
-    def __init__(self, parent, board_name, ip, log_callback):
-        super().__init__(parent, text=f"  {board_name} ({ip})  ", padding=10)
+    def __init__(self, parent, tm, board_name, ip, log_callback, shield=""):
+        # Shield in the subtitle, not the title -- see ColorSensorPanel.
+        subtitle = " · ".join(p for p in (f"{shield} shield" if shield else "",
+                                          "Servo controller", ip) if p)
+        super().__init__(parent, tm, board_name, subtitle)
         self.board_name = board_name
         self.ip = ip
         self.log = log_callback
         self._build_ui()
+        self.register_theme()
 
     def _build_ui(self):
-        status_frame = ttk.Frame(self)
-        status_frame.pack(fill="x", pady=(0, 8))
+        self.status_row(button_text="Test", button_cmd=self._test_connection)
 
-        ttk.Label(status_frame, text="Status:").pack(side="left")
-        self.status_label = ttk.Label(
-            status_frame, text="Unknown", foreground="gray",
-            font=("TkDefaultFont", 10, "bold")
-        )
-        self.status_label.pack(side="left", padx=6)
-        ttk.Button(status_frame, text="Test", command=self._test_connection).pack(side="right")
+        servo_frame = tk.LabelFrame(self.body, text="Servo Control", padx=SM, pady=SM)
+        servo_frame.pack(fill="both", expand=True, pady=(SM, 0))
+        self._group_frames = [servo_frame]
+        self._frames.append(servo_frame)
 
-        servo_frame = ttk.LabelFrame(self, text="Servo Control", padding=6)
-        servo_frame.pack(fill="x", pady=4)
+        # Vertical layout: each servo's caption sits above its own ON/OFF pair,
+        # rather than all three sharing one row. This panel has no plot, so it
+        # takes the narrow column, where a label+2 buttons row would squeeze the
+        # captions.
+        for idx in (1, 2):
+            block = tk.Frame(servo_frame)
+            block.pack(fill="x", pady=(0, SM))
+            self._frames.append(block)
+            self.track(tk.Label(block, text=f"Servo {idx}:", anchor="w",
+                                font=self.tm.font_ui), muted=True).pack(fill="x")
 
-        s1_row = ttk.Frame(servo_frame)
-        s1_row.pack(fill="x", pady=2)
-        ttk.Label(s1_row, text="Servo 1:", width=8).pack(side="left")
-        ttk.Button(s1_row, text="ON", command=lambda: self._send("SERVO1_ON")).pack(
-            side="left", padx=2, expand=True, fill="x")
-        ttk.Button(s1_row, text="OFF", command=lambda: self._send("SERVO1_OFF")).pack(
-            side="left", padx=2, expand=True, fill="x")
+            btn_row = tk.Frame(block)
+            btn_row.pack(fill="x", pady=(XS, 0))
+            self._frames.append(btn_row)
+            for state in ("ON", "OFF"):
+                ttk.Button(btn_row, text=state, style="DS.TButton",
+                           command=lambda i=idx, s=state: self._send(f"SERVO{i}_{s}")
+                           ).pack(side="left", padx=(0, XS), expand=True, fill="x")
 
-        s2_row = ttk.Frame(servo_frame)
-        s2_row.pack(fill="x", pady=2)
-        ttk.Label(s2_row, text="Servo 2:", width=8).pack(side="left")
-        ttk.Button(s2_row, text="ON", command=lambda: self._send("SERVO2_ON")).pack(
-            side="left", padx=2, expand=True, fill="x")
-        ttk.Button(s2_row, text="OFF", command=lambda: self._send("SERVO2_OFF")).pack(
-            side="left", padx=2, expand=True, fill="x")
+        ttk.Button(servo_frame, text="Servo Status", style="DS.TButton",
+                   command=lambda: self._send("SERVO_STATUS")).pack(fill="x", pady=(XS, 0))
 
-        status_row = ttk.Frame(servo_frame)
-        status_row.pack(fill="x", pady=(4, 0))
-        ttk.Button(status_row, text="Servo Status", command=lambda: self._send("SERVO_STATUS")).pack(
-            fill="x", padx=2)
+        self.servo1_state_label = tk.Label(servo_frame, text="Servo 1: --",
+                                           font=self.tm.font_mono_bold, anchor="nw")
+        self.servo1_state_label.pack(fill="x", pady=(SM, 0))
+        self.servo2_state_label = tk.Label(servo_frame, text="Servo 2: --",
+                                           font=self.tm.font_mono_bold, anchor="nw")
+        # The last child absorbs the card's slack so there is no dead gap.
+        self.servo2_state_label.pack(fill="both", expand=True)
+        self.track(self.servo1_state_label, self.servo2_state_label)
 
-        self.servo1_state_label = ttk.Label(servo_frame, text="Servo 1: --", font=("TkDefaultFont", 10))
-        self.servo1_state_label.pack(pady=(6, 0))
-        self.servo2_state_label = ttk.Label(servo_frame, text="Servo 2: --", font=("TkDefaultFont", 10))
-        self.servo2_state_label.pack(pady=(2, 0))
+    def apply_theme(self):
+        super().apply_theme()
+        t = self.tm.theme
+        for f in self._group_frames:
+            f.configure(bg=t["card"], fg=t["text2"],
+                        highlightbackground=t["border"], bd=1, relief="solid")
 
     def _test_connection(self):
         def worker():
@@ -677,11 +1085,11 @@ class ServoBoardPanel(ttk.LabelFrame):
 
     def _on_test_result(self, resp):
         if resp is not None:
-            self.status_label.config(text="Reachable", foreground="green")
+            self.set_status("Reachable", "ok")
             self.log(self.board_name, f"Board reachable at {self.ip}")
             self._parse_status(resp)
         else:
-            self.status_label.config(text="Unreachable", foreground="red")
+            self.set_status("Unreachable", "error")
             self.log(self.board_name, f"Cannot reach {self.ip}")
 
     def _send(self, cmd):
@@ -696,7 +1104,7 @@ class ServoBoardPanel(ttk.LabelFrame):
 
     def _on_response(self, cmd, resp):
         self.log(self.board_name, f"<< {resp}")
-        self.status_label.config(text="Reachable", foreground="green")
+        self.set_status("Reachable", "ok")
         if cmd == "SERVO1_ON" and resp == "OK":
             self.servo1_state_label.config(text="Servo 1: ON")
         elif cmd == "SERVO1_OFF" and resp == "OK":
@@ -718,14 +1126,14 @@ class ServoBoardPanel(ttk.LabelFrame):
 
     def _on_error(self, cmd):
         self.log(self.board_name, f"<< ERROR: no response to {cmd}")
-        self.status_label.config(text="Unreachable", foreground="red")
+        self.set_status("Unreachable", "error")
 
 
-class CN0575Panel(ttk.LabelFrame):
+class CN0575Panel(CardPanel):
     """UI panel for CN0575 with ADT75 temperature graph."""
 
-    def __init__(self, parent, log_callback):
-        super().__init__(parent, text=f"  CN0575 — ADT75 Sensor ({CN0575_IP})  ", padding=10)
+    def __init__(self, parent, tm, log_callback):
+        super().__init__(parent, tm, "CN0575", f"ADT75 temperature · {CN0575_IP}")
         self.log = log_callback
         self.ip = CN0575_IP
         self.board_name = "CN0575"
@@ -735,52 +1143,51 @@ class CN0575Panel(ttk.LabelFrame):
         self.auto_refresh_job = None
         self.start_time = None
         self._build_ui()
+        self.register_theme()
 
     def _build_ui(self):
-        status_frame = ttk.Frame(self)
-        status_frame.pack(fill="x", pady=(0, 8))
+        self.status_row(button_text="Test", button_cmd=self._test_connection)
 
-        ttk.Label(status_frame, text="Status:").pack(side="left")
-        self.status_label = ttk.Label(
-            status_frame, text="Unknown", foreground="gray",
-            font=("TkDefaultFont", 10, "bold")
-        )
-        self.status_label.pack(side="left", padx=6)
-        ttk.Button(status_frame, text="Test", command=self._test_connection).pack(side="right")
+        # The readout shares the control row rather than owning a full-width row
+        # of its own: that row plus its padding cost ~35px of chrome, and the
+        # graph below is the panel's point. Same treatment as ColorSensorPanel.
+        ctrl_frame = tk.Frame(self.body)
+        ctrl_frame.pack(fill="x", pady=(SM, 0))
+        self._frames.append(ctrl_frame)
 
-        temp_value_frame = ttk.Frame(self)
-        temp_value_frame.pack(fill="x", pady=4)
+        self.temp_label = tk.Label(ctrl_frame, text="ADT75 Temp: -- C",
+                                   font=self.tm.font_readout, anchor="w")
+        self.temp_label.pack(side="left")
+        self.track(self.temp_label)
 
-        self.temp_label = ttk.Label(
-            temp_value_frame, text="ADT75 Temp: -- C",
-            font=("TkDefaultFont", 14, "bold")
-        )
-        self.temp_label.pack(side="left", padx=5)
-
-        ctrl_frame = ttk.Frame(self)
-        ctrl_frame.pack(fill="x", pady=4)
-
-        ttk.Button(ctrl_frame, text="Read Temp", command=self._read_temp).pack(side="left", padx=2)
-        ttk.Checkbutton(
-            ctrl_frame, text="Live (5s)",
-            variable=self.auto_refresh_var,
-            command=self._toggle_auto_refresh
-        ).pack(side="left", padx=10)
-        ttk.Button(ctrl_frame, text="Clear", command=self._clear_graph).pack(side="right", padx=2)
+        # Packed right-to-left so the visual order stays Read Temp | Live | Clear.
+        ttk.Button(ctrl_frame, text="Clear", style="DS.TButton",
+                   command=self._clear_graph).pack(side="right")
+        ttk.Checkbutton(ctrl_frame, text="Live (5s)", style="DS.TCheckbutton",
+                        variable=self.auto_refresh_var,
+                        command=self._toggle_auto_refresh).pack(side="right", padx=SM)
+        ttk.Button(ctrl_frame, text="Read Temp", style="DS.TButton",
+                   command=self._read_temp).pack(side="right")
 
         if HAS_MATPLOTLIB:
-            self.fig = Figure(figsize=(4, 2), dpi=80)
-            self.fig.patch.set_facecolor("#f0f0f0")
+            # constrained layout, matching ColorSensorPanel/ADXL355Panel --
+            # tight_layout() baked in fractional margins at the initial figsize
+            # and left the axes only 54% of this short canvas.
+            self.fig = Figure(figsize=(3.2, 2.0), dpi=80, layout="constrained")
             self.ax = self.fig.add_subplot(111)
             self.ax.set_xlabel("Time (s)", fontsize=8)
             self.ax.set_ylabel("Temp (C)", fontsize=8)
-            self.ax.tick_params(labelsize=7)
-            self.ax.grid(True, alpha=0.3)
-            self.line, = self.ax.plot([], [], "b-o", markersize=2, linewidth=1)
-            self.fig.tight_layout()
+            self.line, = self.ax.plot([], [], "-o", markersize=2, linewidth=1,
+                                      color=PRIMARY[500])
 
-            self.canvas = FigureCanvasTkAgg(self.fig, master=self)
-            self.canvas.get_tk_widget().pack(fill="both", expand=True, pady=(4, 0))
+            self.canvas = FigureCanvasTkAgg(self.fig, master=self.body)
+            self.canvas.get_tk_widget().pack(fill="both", expand=True, pady=(SM, 0))
+
+    def style_plot(self):
+        if HAS_MATPLOTLIB:
+            self.line.set_color(PRIMARY[500] if self.tm.theme_name == "light"
+                                else PRIMARY[300])
+            self.theme_axes(self.fig, self.ax, self.canvas)
 
     def _test_connection(self):
         def worker():
@@ -790,11 +1197,11 @@ class CN0575Panel(ttk.LabelFrame):
 
     def _on_test_result(self, resp):
         if resp is not None and resp.startswith("TEMP:"):
-            self.status_label.config(text="Reachable", foreground="green")
+            self.set_status("Reachable", "ok")
             self.log(self.board_name, f"Sensor reachable - {resp}")
             self.temp_label.config(text=f"ADT75 Temp: {resp[5:]} C")
         else:
-            self.status_label.config(text="Unreachable", foreground="red")
+            self.set_status("Unreachable", "error")
             self.log(self.board_name, f"Cannot reach {self.ip}")
 
     def _read_temp(self):
@@ -809,7 +1216,7 @@ class CN0575Panel(ttk.LabelFrame):
 
     def _on_temp_response(self, resp):
         self.log(self.board_name, f"<< {resp}")
-        self.status_label.config(text="Reachable", foreground="green")
+        self.set_status("Reachable", "ok")
 
         if resp.startswith("TEMP:"):
             try:
@@ -826,7 +1233,7 @@ class CN0575Panel(ttk.LabelFrame):
 
     def _on_error(self):
         self.log(self.board_name, "<< ERROR: no response")
-        self.status_label.config(text="Unreachable", foreground="red")
+        self.set_status("Unreachable", "error")
 
     def _update_graph(self):
         if not HAS_MATPLOTLIB or not self.temp_history:
@@ -872,75 +1279,112 @@ class CN0575Panel(ttk.LabelFrame):
             self.after_cancel(self.auto_refresh_job)
 
 
-class SWIOT1LPanel(ttk.LabelFrame):
+class SWIOT1LPanel(CardPanel):
     """UI panel for SWIOT1L fan PWM control."""
 
-    def __init__(self, parent, log_callback):
-        super().__init__(parent, text=f"  SWIOT1L — Fan Control ({SWIOT_IP})  ", padding=10)
+    def __init__(self, parent, tm, log_callback):
+        super().__init__(parent, tm, "SWIOT1L", f"Fan PWM control · {SWIOT_IP}")
         self.log = log_callback
         self.board_name = "SWIOT1L"
         self.connected = False
         self.max14906 = None
         self.duty_cycle = 0.0
         self.pwm_running = False
-        self.speed_history = deque(maxlen=GRAPH_MAX_POINTS)
-        self.time_history = deque(maxlen=GRAPH_MAX_POINTS)
-        self.start_time = None
         self._build_ui()
+        self.register_theme()
 
     def _build_ui(self):
-        status_frame = ttk.Frame(self)
-        status_frame.pack(fill="x", pady=(0, 8))
+        _, self._btn_connect = self.status_row(value="Disconnected",
+                                               button_text="Connect",
+                                               button_cmd=self._connect)
 
-        ttk.Label(status_frame, text="Status:").pack(side="left")
-        self.status_label = ttk.Label(
-            status_frame, text="Disconnected", foreground="gray",
-            font=("TkDefaultFont", 10, "bold")
-        )
-        self.status_label.pack(side="left", padx=6)
-        ttk.Button(status_frame, text="Connect", command=self._connect).pack(side="right")
+        # No LabelFrame wrapper: it nested a second border inside the Card and
+        # its title only restated the card's own "Fan PWM control" subtitle,
+        # while its padding was consuming height the fan needs at minsize.
+        dc_row = tk.Frame(self.body)
+        dc_row.pack(fill="x", pady=(SM, 0))
+        self._frames.append(dc_row)
 
-        ctrl_frame = ttk.LabelFrame(self, text="PWM Control", padding=6)
-        ctrl_frame.pack(fill="x", pady=4)
-
-        dc_row = ttk.Frame(ctrl_frame)
-        dc_row.pack(fill="x")
-
-        ttk.Label(dc_row, text="Duty (%):").pack(side="left")
-        self.dc_entry = ttk.Entry(dc_row, width=6)
+        self.track(tk.Label(dc_row, text="Duty (%):", font=self.tm.font_ui),
+                   muted=True).pack(side="left")
+        self.dc_entry = ttk.Entry(dc_row, width=6, style="DS.TEntry")
         self.dc_entry.insert(0, "0")
-        self.dc_entry.pack(side="left", padx=4)
+        self.dc_entry.pack(side="left", padx=SM)
 
-        ttk.Button(dc_row, text="Set", command=self._set_pwm).pack(side="left", padx=2)
-        ttk.Button(dc_row, text="Stop", command=self._stop_pwm).pack(side="left", padx=2)
+        Button(dc_row, self.tm, "Set", self._set_pwm,
+               variant="primary", height=28).pack(side="left")
+        Button(dc_row, self.tm, "Stop", self._stop_pwm,
+               variant="secondary", height=28).pack(side="left", padx=(XS, 0))
 
-        self.dc_label = ttk.Label(ctrl_frame, text="0% - 0 RPM", font=("TkDefaultFont", 10))
-        self.dc_label.pack(pady=(6, 0))
+        # Fan + readout. The fan shows *that* the fan is commanded on; the
+        # numbers carry the detail. See FanIndicator on why it does not spin
+        # proportionally to duty.
+        fan_row = tk.Frame(self.body)
+        fan_row.pack(fill="both", expand=True, pady=(SM, 0))
+        self._frames.append(fan_row)
 
-        if HAS_MATPLOTLIB:
-            self.fig = Figure(figsize=(4, 2), dpi=80)
-            self.fig.patch.set_facecolor("#f0f0f0")
-            self.ax = self.fig.add_subplot(111)
-            self.ax.set_xlabel("Time (s)", fontsize=8)
-            self.ax.set_ylabel("RPM", fontsize=8)
-            self.ax.tick_params(labelsize=7)
-            self.ax.grid(True, alpha=0.3)
-            self.line, = self.ax.plot([], [], "r-o", markersize=2, linewidth=1)
-            self.fig.tight_layout()
+        # The fan and readout pack left-to-right inside this group, and the
+        # group itself is centred in the row: expand=True hands it the spare
+        # width and fill="y" (not "both") leaves it free to sit in the middle,
+        # while still passing full height down so the glyph can size itself.
+        group = tk.Frame(fan_row)
+        group.pack(expand=True, fill="y")
+        self._frames.append(group)
 
-            self.canvas = FigureCanvasTkAgg(self.fig, master=self)
-            self.canvas.get_tk_widget().pack(fill="both", expand=True, pady=(4, 0))
+        self.fan = FanIndicator(group, self.tm)
+        self.fan.pack(side="left", fill="y", padx=(0, MD))
+        self._frames.append(self.fan)
+
+        readout = tk.Frame(group)
+        readout.pack(side="left", anchor="center")
+        self._frames.append(readout)
+
+        self.duty_value = self.track(
+            tk.Label(readout, text="0%", font=self.tm.font_h1, anchor="w"))
+        self.duty_value.pack(fill="x")
+        self.track(tk.Label(readout, text="DUTY CYCLE", font=self.tm.font_small,
+                            anchor="w"), muted=True).pack(fill="x")
+        self.rpm_value = self.track(
+            tk.Label(readout, text="~0 RPM est.", font=self.tm.font_mono,
+                     anchor="w"), muted=True)
+        self.rpm_value.pack(fill="x", pady=(SM, 0))
+
+        # Motion and colour are never the only cue that the fan is running
+        # (CLAUDE.md: always pair critical icons with visible labels).
+        self.run_state = tk.Label(readout, text="STOPPED",
+                                  font=self.tm.font_small, anchor="w")
+        self.run_state.pack(fill="x", pady=(XS, 0))
+
+    def apply_theme(self):
+        super().apply_theme()
+        t = self.tm.theme
+        # No _group_frames loop: this panel has no LabelFrame, so every frame
+        # and label is handled by the base class via self._frames.
+        # Like status_label, this label's fg encodes state.
+        self.run_state.configure(
+            bg=t["card"],
+            fg=status_text_color(self.tm.theme_name,
+                                 "ok" if self.pwm_running else "idle"))
 
     def _connect(self):
-        if not HAS_ADI:
+        if not HAS_ADI and not args.demo:
             self.log(self.board_name, "pyadi-iio not installed")
             return
 
-        self.status_label.config(text="Connecting...", foreground="orange")
+        self.set_status("Connecting...", "warn")
         self.log(self.board_name, "Connecting to SWIOT1L...")
 
         def worker():
             try:
+                if args.demo:
+                    # Synthetic stand-in: the RPM trace is derived from
+                    # duty_cycle, not read back from the board, so the graph
+                    # behaves exactly as it does on real hardware.
+                    time.sleep(0.4)
+                    self.max14906 = _DemoADIDevice()
+                    self.connected = True
+                    self.after(0, self._on_connected)
+                    return
                 swiot = adi.swiot(uri=f"ip:{SWIOT_IP}")
                 swiot.mode = "config"
                 swiot = adi.swiot(uri=f"ip:{SWIOT_IP}")
@@ -969,11 +1413,25 @@ class SWIOT1LPanel(ttk.LabelFrame):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_connected(self):
-        self.status_label.config(text="Connected", foreground="green")
+        self.set_status("Connected", "ok")
+        self.fan.set_enabled(True)
         self.log(self.board_name, "Connected - ready for PWM")
 
+    def _set_readout(self, dc, running):
+        """Update the duty/RPM/state readout beside the fan.
+
+        The RPM figure is duty rescaled by DC_RPM, not a tachometer reading, so
+        it is labelled as an estimate.
+        """
+        self.duty_value.config(text=f"{dc:.0f}%")
+        self.rpm_value.config(text=f"~{DC_RPM * dc / 100.0:.0f} RPM est.")
+        self.run_state.config(
+            text="RUNNING" if running else "STOPPED",
+            fg=status_text_color(self.tm.theme_name,
+                                 "ok" if running else "idle"))
+
     def _on_connect_error(self, err):
-        self.status_label.config(text="Error", foreground="red")
+        self.set_status("Error", "error")
         self.log(self.board_name, f"Connection failed: {err}")
 
     def _set_pwm(self):
@@ -988,19 +1446,19 @@ class SWIOT1LPanel(ttk.LabelFrame):
             return
 
         self.duty_cycle = dc
-        rpm = DC_RPM * dc / 100.0
-        self.dc_label.config(text=f"{dc:.0f}% - {rpm:.0f} RPM")
+        self._set_readout(dc, running=True)
         self.log(self.board_name, f"Duty cycle set to {dc:.0f}%")
 
         if not self.pwm_running:
             self.pwm_running = True
             threading.Thread(target=self._pwm_loop, daemon=True).start()
-            self._graph_tick()
+        self.fan.start()
 
     def _stop_pwm(self):
         self.pwm_running = False
         self.duty_cycle = 0.0
-        self.dc_label.config(text="0% - 0 RPM")
+        self.fan.stop()
+        self._set_readout(0.0, running=False)
         if self.connected and self.max14906:
             try:
                 self.max14906.channel["voltage0"].raw = 0
@@ -1028,36 +1486,9 @@ class SWIOT1LPanel(ttk.LabelFrame):
             except Exception:
                 break
 
-    def _graph_tick(self):
-        if not self.pwm_running:
-            return
-        if self.start_time is None:
-            self.start_time = datetime.now()
-        elapsed = (datetime.now() - self.start_time).total_seconds()
-        rpm = DC_RPM * self.duty_cycle / 100.0
-        self.time_history.append(elapsed)
-        self.speed_history.append(rpm)
-        self._update_graph()
-        if self.pwm_running:
-            self.after(1000, self._graph_tick)
-
-    def _update_graph(self):
-        if not HAS_MATPLOTLIB or not self.speed_history:
-            return
-        times = list(self.time_history)
-        speeds = list(self.speed_history)
-        self.line.set_data(times, speeds)
-        self.ax.set_xlim(max(0, times[0] - 2), times[-1] + 2)
-        if len(speeds) > 1:
-            s_min, s_max = min(speeds), max(speeds)
-            margin = max(100, (s_max - s_min) * 0.2)
-            self.ax.set_ylim(max(0, s_min - margin), s_max + margin)
-        else:
-            self.ax.set_ylim(0, DC_RPM + 500)
-        self.canvas.draw_idle()
-
     def cleanup(self):
         self.pwm_running = False
+        self.fan.stop()
         if self.connected and self.max14906:
             try:
                 self.max14906.channel["voltage0"].raw = 0
@@ -1065,12 +1496,13 @@ class SWIOT1LPanel(ttk.LabelFrame):
                 pass
 
 
-class ADXL355Panel(ttk.LabelFrame):
+class ADXL355Panel(CardPanel):
     """Compact ADXL355 predictive maintenance panel."""
 
-    def __init__(self, parent, log_callback, use_demo=False):
+    def __init__(self, parent, tm, log_callback, use_demo=False):
         host_info = "Demo" if use_demo else f"{args.adxl_host}:{args.adxl_port}"
-        super().__init__(parent, text=f"  ADXL355 — Vibration Monitor ({host_info})  ", padding=10)
+        super().__init__(parent, tm, "ADXL355",
+                         f"Vibration monitor · {host_info}")
         self.log = log_callback
         self.board_name = "ADXL355"
         self.use_demo = use_demo
@@ -1078,6 +1510,10 @@ class ADXL355Panel(ttk.LabelFrame):
         self._running = False
         self._update_id = None
         self._prev_level = ["OK"] * 3
+        # Cached for the app's lifetime, never written to disk. Cleared on auth
+        # failure so a typo can be corrected without restarting.
+        self._ssh_password = None
+        self._yield_fn = None
 
         # FFT helpers
         self._window = np.hanning(ADXL_FFT_WIN)
@@ -1087,74 +1523,250 @@ class ADXL355Panel(ttk.LabelFrame):
         self._fdisp = freqs[self._fmask]
 
         self._build_ui()
+        self.register_theme()
 
     def _build_ui(self):
-        # Status row
-        status_frame = ttk.Frame(self)
-        status_frame.pack(fill="x", pady=(0, 8))
+        row, _ = self.status_row(value="Stopped")
+        self._btn_start = Button(row, self.tm, "Start", self._start,
+                                 variant="primary", height=28)
+        self._btn_start.pack(side="right")
+        self._btn_stop = Button(row, self.tm, "Stop", self._stop,
+                                variant="secondary", height=28)
+        self._btn_stop.pack(side="right", padx=(0, XS))
+        self._btn_stop.set_enabled(False)
+        # Brings up the servers this panel (and CN0575) read from, over SSH, so
+        # the demo can be started without a terminal on the Pi.
+        self._btn_servers = Button(row, self.tm, "Start Servers",
+                                   self._start_servers,
+                                   variant="secondary", height=28)
+        self._btn_servers.pack(side="right", padx=(0, XS))
 
-        ttk.Label(status_frame, text="Status:").pack(side="left")
-        self.status_label = ttk.Label(
-            status_frame, text="Stopped", foreground="gray",
-            font=("TkDefaultFont", 10, "bold")
-        )
-        self.status_label.pack(side="left", padx=6)
-
-        self._btn_stop = ttk.Button(status_frame, text="Stop", command=self._stop, state=tk.DISABLED)
-        self._btn_stop.pack(side="right", padx=2)
-        self._btn_start = ttk.Button(status_frame, text="Start", command=self._start)
-        self._btn_start.pack(side="right", padx=2)
-
-        # Axis status indicators
-        axis_frame = ttk.LabelFrame(self, text="Axis Health", padding=4)
-        axis_frame.pack(fill="x", pady=4)
+        # Axis status indicators. Now in the wide top row, so it can breathe.
+        axis_frame = tk.LabelFrame(self.body, text="Axis Health", padx=SM, pady=XS)
+        axis_frame.pack(fill="x", pady=(SM, 0))
+        self._group_frames = [axis_frame]
+        self._frames.append(axis_frame)
 
         self._status_canvases = []
         self._status_labels = []
         self._rms_labels = []
 
         for i, name in enumerate(AXIS_NAMES):
-            row = ttk.Frame(axis_frame)
-            row.pack(fill="x", padx=4, pady=1)
+            row = tk.Frame(axis_frame)
+            row.pack(fill="x", pady=1)
+            self._frames.append(row)
 
             c = tk.Canvas(row, width=12, height=12, highlightthickness=0)
-            c.pack(side="left", padx=(0, 4))
-            oval = c.create_oval(1, 1, 11, 11, fill="#2ecc71", outline="")
+            c.pack(side="left", padx=(0, XS))
+            oval = c.create_oval(1, 1, 11, 11, fill=SUCCESS[500], outline="")
             self._status_canvases.append((c, oval))
+            self._frames.append(c)
 
-            ttk.Label(row, text=f"{name}:", width=3).pack(side="left")
-            sl = ttk.Label(row, text="OK", width=8, foreground="#2ecc71",
-                           font=("TkDefaultFont", 9, "bold"))
+            self.track(tk.Label(row, text=f"{name}:", width=3, anchor="w",
+                                font=self.tm.font_ui), muted=True).pack(side="left")
+            # The dot is never the sole indicator: this label spells out the level.
+            sl = tk.Label(row, text="OK", width=8, anchor="w", fg=SUCCESS[500],
+                          font=self.tm.font_small)
             sl.pack(side="left")
             self._status_labels.append(sl)
+            self._frames.append(sl)
 
-            rl = ttk.Label(row, text="RMS: --", font=("Courier", 8))
+            rl = tk.Label(row, text="RMS: --", font=self.tm.font_mono)
             rl.pack(side="right")
             self._rms_labels.append(rl)
+            self.track(rl, muted=True)
 
-        # FFT plot (single axis selector + plot)
+        # FFT plot (per-axis toggles + overlaid plot)
         if HAS_MATPLOTLIB:
-            plot_ctrl = ttk.Frame(self)
-            plot_ctrl.pack(fill="x", pady=2)
-            ttk.Label(plot_ctrl, text="Show axis:").pack(side="left")
-            self._axis_var = tk.IntVar(value=0)
+            plot_ctrl = tk.Frame(self.body)
+            plot_ctrl.pack(fill="x", pady=(SM, 0))
+            self._frames.append(plot_ctrl)
+            self.track(tk.Label(plot_ctrl, text="Show axes:", font=self.tm.font_ui),
+                       muted=True).pack(side="left")
+            # Checkbuttons, not Radiobuttons: the axes overlay so any subset can
+            # be shown at once, which is what makes them comparable.
+            self._axis_vars = [tk.BooleanVar(value=True) for _ in AXIS_NAMES]
             for i, name in enumerate(AXIS_NAMES):
-                ttk.Radiobutton(plot_ctrl, text=name, variable=self._axis_var, value=i).pack(side="left", padx=2)
+                ttk.Checkbutton(plot_ctrl, text=name, style="DS.TCheckbutton",
+                                variable=self._axis_vars[i],
+                                command=self.style_plot).pack(side="left", padx=(XS, 0))
 
-            self.fig = Figure(figsize=(4, 2.2), dpi=80)
-            self.fig.patch.set_facecolor("#f0f0f0")
+            # constrained layout (not a one-off tight_layout) so the axes keep
+            # filling the card as it resizes — tight_layout bakes in fractional
+            # margins at the initial figsize, leaving dead space once wider.
+            # Measured full draw at 1500x1000: 28 ms/frame with one axis ticked,
+            # 38 ms with all three, against the 100 ms budget at 10 Hz.
+            self.fig = Figure(figsize=(5.0, 2.0), dpi=80, layout="constrained")
             self.ax = self.fig.add_subplot(111)
             self.ax.set_xlabel("Hz", fontsize=8)
-            self.ax.set_ylabel("g", fontsize=8)
-            self.ax.set_title("FFT", fontsize=9)
-            self.ax.tick_params(labelsize=7)
-            self.ax.grid(True, alpha=0.3)
+            # No in-figure title: the card is already labelled, and the y-label
+            # (single axis) or legend (several) says which trace is which.
+            self.ax.set_ylabel("FFT (g)", fontsize=8)
             self.ax.set_xlim(0, ADXL_FREQ_MAX)
-            self.line, = self.ax.plot([], [], lw=1, color=AXIS_COLORS[0])
-            self.fig.tight_layout()
+            self.lines = [
+                self.ax.plot([], [], lw=1, color=AXIS_COLORS[i], label=name,
+                             animated=True)[0]
+                for i, name in enumerate(AXIS_NAMES)
+            ]
 
-            self.canvas = FigureCanvasTkAgg(self.fig, master=self)
-            self.canvas.get_tk_widget().pack(fill="both", expand=True, pady=(4, 0))
+            self.canvas = FigureCanvasTkAgg(self.fig, master=self.body)
+            self.canvas.get_tk_widget().pack(fill="both", expand=True, pady=(SM, 0))
+            self._bg = None
+            self.canvas.mpl_connect("draw_event", self._on_full_draw)
+
+    def _on_full_draw(self, event):
+        self._bg = self.canvas.copy_from_bbox(self.ax.bbox)
+
+    def _blit_lines(self):
+        if self._bg is None:
+            self.canvas.draw()
+        self.canvas.restore_region(self._bg)
+        for line in self.lines:
+            if line.get_visible():
+                self.ax.draw_artist(line)
+        self.canvas.blit(self.ax.bbox)
+        self.canvas.flush_events()
+
+    def apply_theme(self):
+        super().apply_theme()
+        t = self.tm.theme
+        for f in self._group_frames:
+            f.configure(bg=t["card"], fg=t["text2"],
+                        highlightbackground=t["border"], bd=1, relief="solid")
+
+    def style_plot(self):
+        """Recolour traces, apply the axis toggles, and label accordingly.
+
+        Runs on a toggle or a theme switch, not per frame, so rebuilding the
+        legend here is cheap.
+        """
+        if not HAS_MATPLOTLIB:
+            return
+        shown = []
+        for i, line in enumerate(self.lines):
+            line.set_color(AXIS_COLORS[i])
+            visible = self._axis_vars[i].get()
+            line.set_visible(visible)
+            if visible:
+                shown.append(line)
+
+        # One axis needs no legend — the y-label names it, as before. Several
+        # do, and the legend must exist before theme_axes recolours its text.
+        leg = self.ax.get_legend()
+        if leg is not None:
+            leg.remove()
+        if len(shown) == 1:
+            self.ax.set_ylabel(f"FFT {shown[0].get_label()} (g)", fontsize=8)
+        else:
+            self.ax.set_ylabel("FFT (g)", fontsize=8)
+            if shown:
+                self.ax.legend(handles=shown, fontsize=7, loc="upper right",
+                               frameon=False)
+
+        self.theme_axes(self.fig, self.ax, self.canvas)
+        self._bg = None
+
+    # ------------------------------------------------------- remote servers
+    def _start_servers(self):
+        """Start both Pi-side servers over SSH, detached.
+
+        Runs off the UI thread: ssh can block for SSH_CONNECT_TIMEOUT, which
+        would freeze the window. Results come back via after(0, ...) like every
+        other worker in this app.
+        """
+        # Prompted on the UI thread, before the worker starts: a modal dialog
+        # cannot be raised from a background thread.
+        if self._ssh_password is None:
+            self._ssh_password = simpledialog.askstring(
+                "SSH password", f"Password for {REMOTE_HOST}:",
+                show="*", parent=self)
+        if not self._ssh_password:
+            self.log(self.board_name, "<< cancelled: no password entered")
+            return
+
+        self._btn_servers.set_enabled(False)
+        self.log(self.board_name, f">> ssh {REMOTE_HOST}: starting servers")
+
+        def worker():
+            # sshpass -e reads SSHPASS from the environment; -p would expose the
+            # password in the process list to every user on the machine.
+            ssh_env = dict(os.environ, SSHPASS=self._ssh_password)
+            ssh_base = ["sshpass", "-e",
+                        "ssh", "-o", "StrictHostKeyChecking=no",
+                        "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
+                        REMOTE_HOST]
+            try:
+                kill_cmd, launch_cmd = self._remote_launch_commands()
+                subprocess.run(ssh_base + [kill_cmd],
+                               capture_output=True, text=True, env=ssh_env,
+                               timeout=SSH_CONNECT_TIMEOUT + 5)
+                proc = subprocess.run(ssh_base + [launch_cmd],
+                                      capture_output=True, text=True, env=ssh_env,
+                                      timeout=SSH_CONNECT_TIMEOUT + 20)
+            except subprocess.TimeoutExpired:
+                self.after(0, lambda: self._on_servers_done(
+                    False, "ssh timed out (host unreachable?)"))
+                return
+            except OSError as exc:
+                self.after(0, lambda e=exc: self._on_servers_done(
+                    False, f"cannot run ssh: {e}"))
+                return
+            ok = proc.returncode == 0
+            detail = (proc.stdout or "").strip() or (proc.stderr or "").strip()
+            self.after(0, lambda: self._on_servers_done(ok, detail))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _remote_launch_commands():
+        """Return (kill_cmd, launch_cmd) for two separate SSH calls.
+
+        Splitting kill and launch avoids pkill -9 taking out the SSH
+        session that carries the launch command.
+        """
+        kills = []
+        for _label, _dir, script, _a, _log in REMOTE_SERVERS:
+            pat = f"[{script[0]}]{script[1:]}"
+            kills.append(f"pkill -9 -f '{pat}' 2>/dev/null")
+        kill_cmd = " ; ".join(kills + ["sleep 1", "echo KILLED"])
+
+        launches = []
+        for _label, directory, script, script_args, log in REMOTE_SERVERS:
+            launches.append(
+                f"(nohup python3 ~/{directory}/{script} {script_args} "
+                f">{REMOTE_LOG_DIR}/{log}.log 2>&1 &)"
+            )
+        checks = []
+        for _label, _dir, script, _a, _log in REMOTE_SERVERS:
+            pat = f"[{script[0]}]{script[1:]}"
+            checks.append(f"pgrep -f '{pat}' >/dev/null && echo UP:{script} "
+                          f"|| echo DOWN:{script}")
+        launch_cmd = " ; ".join(launches + ["sleep 6"] + checks)
+
+        return kill_cmd, launch_cmd
+
+    def _on_servers_done(self, ok, detail):
+        self._btn_servers.set_enabled(True)
+        down = [ln[5:] for ln in detail.splitlines() if ln.startswith("DOWN:")]
+        up = [ln[3:] for ln in detail.splitlines() if ln.startswith("UP:")]
+        if ok and up and not down:
+            self.log(self.board_name, f"<< servers up: {', '.join(up)}")
+            return
+        if down:
+            self.log(self.board_name, f"<< ERROR: failed to start {', '.join(down)}"
+                                      f" (see {REMOTE_LOG_DIR}/*.log on the Pi)")
+        else:
+            # No UP/DOWN markers means the script never ran: auth or reachability.
+            low = detail.lower()
+            if "denied" in low or "publickey" in low or "password" in low:
+                # Drop the cached password so the next press re-prompts.
+                self._ssh_password = None
+                hint = "authentication failed — check the password"
+            elif "sshpass" in low or "No such file" in detail:
+                hint = "sshpass not installed (apt install sshpass)"
+            else:
+                hint = detail
+            self.log(self.board_name, f"<< ERROR: {hint or 'ssh failed'}")
 
     def _start(self):
         if self._running:
@@ -1173,13 +1785,13 @@ class ADXL355Panel(ttk.LabelFrame):
             self.acq = ADXL355Acquisition(source)
             self.acq.start()
             self._running = True
-            self.status_label.config(text="Running", foreground="green")
-            self._btn_start.config(state=tk.DISABLED)
-            self._btn_stop.config(state=tk.NORMAL)
+            self.set_status("Running", "ok")
+            self._btn_start.set_enabled(False)
+            self._btn_stop.set_enabled(True)
             self.log(self.board_name, f"Started - FS={ADXL_FS}Hz")
             self._schedule_update()
         except Exception as e:
-            self.status_label.config(text="Error", foreground="red")
+            self.set_status("Error", "error")
             self.log(self.board_name, f"Connection failed: {e}")
 
     def _stop(self):
@@ -1189,15 +1801,16 @@ class ADXL355Panel(ttk.LabelFrame):
         if self._update_id:
             self.after_cancel(self._update_id)
             self._update_id = None
-        self.status_label.config(text="Stopped", foreground="gray")
-        self._btn_start.config(state=tk.NORMAL)
-        self._btn_stop.config(state=tk.DISABLED)
+        self.set_status("Stopped", "idle")
+        self._btn_start.set_enabled(True)
+        self._btn_stop.set_enabled(False)
         self.log(self.board_name, "Stopped")
 
     def _schedule_update(self):
         if self._running:
             self._update()
-            self._update_id = self.after(100, self._schedule_update)
+            interval = 500 if (self._yield_fn and self._yield_fn()) else 200
+            self._update_id = self.after(interval, self._schedule_update)
 
     def _update(self):
         if not self.acq:
@@ -1219,20 +1832,32 @@ class ADXL355Panel(ttk.LabelFrame):
                          f"{AXIS_NAMES[i]}: {self._prev_level[i]} -> {level} (RMS={rms:.3f}g)")
                 self._prev_level[i] = level
 
-        # Update FFT plot for selected axis
+        # Update the FFT plot for every ticked axis, sharing one y-scale.
         if HAS_MATPLOTLIB:
-            axis_idx = self._axis_var.get()
-            samples = bufs[axis_idx]
-            sig = (samples - samples.mean()) * self._window
-            fft_mag = np.abs(np.fft.rfft(sig)) / self._win_norm
-            mag = fft_mag[self._fmask]
+            lo, hi = None, None
+            for i, line in enumerate(self.lines):
+                if not self._axis_vars[i].get():
+                    continue
+                samples = bufs[i]
+                sig = (samples - samples.mean()) * self._window
+                fft_mag = np.abs(np.fft.rfft(sig)) / self._win_norm
+                mag = fft_mag[self._fmask]
 
-            self.line.set_data(self._fdisp, mag)
-            self.line.set_color(AXIS_COLORS[axis_idx])
-            pad = (mag.max() - mag.min()) * 0.15 + 1e-6
-            self.ax.set_ylim(mag.min() - pad, mag.max() + pad)
-            self.ax.set_title(f"FFT - {AXIS_NAMES[axis_idx]}", fontsize=9)
-            self.canvas.draw_idle()
+                line.set_data(self._fdisp, mag)
+                m_lo, m_hi = mag.min(), mag.max()
+                lo = m_lo if lo is None else min(lo, m_lo)
+                hi = m_hi if hi is None else max(hi, m_hi)
+
+            # Untick everything and the limits simply stay put, rather than
+            # autoscaling against an empty set.
+            if lo is not None:
+                pad = (hi - lo) * 0.15 + 1e-6
+                old_lo, old_hi = self.ax.get_ylim()
+                new_lo, new_hi = lo - pad, hi + pad
+                if abs(new_lo - old_lo) > 1e-4 or abs(new_hi - old_hi) > 1e-4:
+                    self.ax.set_ylim(new_lo, new_hi)
+                    self._bg = None
+            self._blit_lines()
 
     def cleanup(self):
         self._stop()
@@ -1241,57 +1866,317 @@ class ADXL355Panel(ttk.LabelFrame):
 # ---------------------------------------------------------------------------
 # Main Application Window
 # ---------------------------------------------------------------------------
-class ControlPanel(tk.Tk):
-    """Main application window with all panels."""
+class ControlPanel(tk.Tk, ThemeMixin):
+    """Main application window: header, panel rows, log and status bar."""
 
     def __init__(self):
         super().__init__()
-        self.title("Industrial Demo — Control Panel")
-        self.geometry("1400x950")
+        self.title("ADI DataX™ - AI-driven 10BASE-T1L Deployment")
+        self.geometry("1500x1000")
         self.minsize(1200, 800)
 
-        # Top row: APARD boards
-        top_frame = ttk.Frame(self)
-        top_frame.pack(fill="x", padx=10, pady=5)
+        # Theme registry must exist before any panel or Button is constructed.
+        self.init_theme(args.theme)
+        fam = pick_font("Segoe UI", "Inter", "DejaVu Sans", "Helvetica")
+        mono = pick_font("Cascadia Mono", "DejaVu Sans Mono", "Courier")
+        self.font_ui         = tkfont.Font(family=fam,  size=9)
+        self.font_small      = tkfont.Font(family=fam,  size=8, weight="bold")
+        self.font_bold       = tkfont.Font(family=fam,  size=10, weight="bold")
+        self.font_h1         = tkfont.Font(family=fam,  size=15, weight="bold")
+        self.font_h2         = tkfont.Font(family=fam,  size=10, weight="bold")
+        self.font_readout    = tkfont.Font(family=fam,  size=11, weight="bold")
+        self.font_mono       = tkfont.Font(family=mono, size=8)
+        self.font_mono_bold  = tkfont.Font(family=mono, size=9, weight="bold")
 
-        self.board1 = ServoBoardPanel(top_frame, "APARD #1", APARD1_IP, self._log_message)
-        self.board1.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        self.style = ttk.Style()
+        self.style.theme_use("clam")
 
-        self.board2 = ColorSensorPanel(top_frame, "APARD #2", APARD2_IP, self._log_message,
-                                        servo_panel=self.board1)
-        self.board2.pack(side="left", fill="both", expand=True, padx=(5, 0))
+        self._build_header()
 
-        # Middle row: CN0575 + SWIOT1L + ADXL355
-        middle_frame = ttk.Frame(self)
-        middle_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        # Bottom chrome is packed BEFORE the expanding panel rows so it always
+        # reserves its space — the panels request tall figures and would
+        # otherwise squeeze the log and status bar off-screen entirely.
+        self._build_statusbar()
+        self._build_log()
 
-        self.cn0575 = CN0575Panel(middle_frame, self._log_message)
-        self.cn0575.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        # The two panel rows live in a grid so their heights are governed by
+        # weights, not by requested content size — with pack(), the top row's
+        # tall colour figure starved the bottom row's three plots.
+        rows = tk.Frame(self)
+        rows.pack(side="top", fill="both", expand=True, padx=XL, pady=(MD, SM))
+        rows.columnconfigure(0, weight=1)
+        rows.rowconfigure(0, weight=1)     # APARD boards
+        rows.rowconfigure(1, weight=1)     # CN0575 / SWIOT1L / ADXL355
 
-        self.swiot = SWIOT1LPanel(middle_frame, self._log_message)
-        self.swiot.pack(side="left", fill="both", expand=True, padx=5)
+        # Top row is 2-up (wide slots), bottom row 3-up (narrow slots).
+        # ADXL355 sits top-left so its FFT gets a wide slot; the servo board,
+        # which has no plot, takes the narrow bottom-right slot.
+        top_frame = tk.Frame(rows)
+        top_frame.grid(row=0, column=0, sticky="nsew", pady=(0, SM))
+        for c in (0, 1):
+            # uniform= as well as weight=: weight alone only divides the *surplus*
+            # space, so the colour panel's wider control row would keep claiming
+            # more than half. Same uniform group == identical column widths.
+            top_frame.columnconfigure(c, weight=1, uniform="top")
+        top_frame.rowconfigure(0, weight=1)
 
-        self.adxl355 = ADXL355Panel(middle_frame, self._log_message, use_demo=args.demo)
-        self.adxl355.pack(side="left", fill="both", expand=True, padx=(5, 0))
+        middle_frame = tk.Frame(rows)
+        middle_frame.grid(row=1, column=0, sticky="nsew", pady=(SM, 0))
+        # The two plot panels share one uniform group so they stay identical;
+        # the servo board has no plot, so it gets a narrower weight and a
+        # vertical control layout to match. uniform= is what actually equalises
+        # 0 and 1 -- weight alone only divides the surplus, and CN0575's readout
+        # row makes it request more than SWIOT1L.
+        for c in (0, 1):
+            middle_frame.columnconfigure(c, weight=3, uniform="mid")
+        middle_frame.columnconfigure(2, weight=2)
+        middle_frame.rowconfigure(0, weight=1)
 
-        # Log area
-        log_frame = ttk.LabelFrame(self, text="Communication Log", padding=5)
-        log_frame.pack(fill="both", padx=10, pady=5)
+        # board1 is built first: ColorSensorPanel takes it as servo_panel so it
+        # can drive the servo sequences on cube detection.
+        self.board1 = ServoBoardPanel(middle_frame, self, "APARD32690 #1",
+                                      APARD1_IP, self._log_message,
+                                      shield="APARD-PFWD")
+        self.board1.grid(row=0, column=2, sticky="nsew", padx=(MD // 2, 0))
+
+        self.adxl355 = ADXL355Panel(top_frame, self, self._log_message,
+                                    use_demo=args.demo)
+        self.adxl355.grid(row=0, column=0, sticky="nsew", padx=(0, MD // 2))
+
+        self.board2 = ColorSensorPanel(top_frame, self, "APARD32690 #2", APARD2_IP,
+                                       self._log_message, servo_panel=self.board1,
+                                       shield="APARD-SPoE")
+        self.board2.grid(row=0, column=1, sticky="nsew", padx=(MD // 2, 0))
+
+        self.adxl355._yield_fn = lambda: self.board2._sorting_enabled
+
+        # Every middle card carries the same total padx (MD // 2) so that equal
+        # columns give equal *cards*: the uniform group equalises columns, and
+        # card width = column width - padx, so mismatched padding would offset
+        # the two panels the user wants identical. Split 4/4 on the middle card
+        # keeps both gutters at 12 px.
+        self.cn0575 = CN0575Panel(middle_frame, self, self._log_message)
+        self.cn0575.grid(row=0, column=0, sticky="nsew", padx=(0, MD // 2))
+
+        self.swiot = SWIOT1LPanel(middle_frame, self, self._log_message)
+        self.swiot.grid(row=0, column=1, sticky="nsew", padx=(MD // 4, MD // 4))
+
+        self._frames = [rows, top_frame, middle_frame,
+                        self._log_host, self._log_head]
+
+        self.apply_theme()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ------------------------------------------------------------------ shell
+    def _build_log(self):
+        """Communication log in a Card, matching the panels."""
+        self._log_host = tk.Frame(self)
+        self._log_host.pack(side="bottom", fill="x", padx=XL, pady=SM)
+        self._log_card = Card(self._log_host, self, pad=MD)
+        self._log_card.outer().pack(fill="both", expand=True)
+
+        self._log_head = tk.Frame(self._log_card.body)
+        self._log_head.pack(fill="x", pady=(0, SM))
+        self._log_title = tk.Label(self._log_head, text="Communication Log",
+                                   font=self.font_h2, anchor="w")
+        self._log_title.pack(side="left")
+
+        self._btn_test_all = Button(self._log_head, self, "Test All", self._test_all,
+                                    variant="primary", height=28)
+        self._btn_test_all.pack(side="right")
+        self._btn_clear = Button(self._log_head, self, "Clear Log", self._clear_log,
+                                 variant="secondary", height=28)
+        self._btn_clear.pack(side="right", padx=(0, SM))
 
         self.log_text = scrolledtext.ScrolledText(
-            log_frame, height=6, state="disabled", font=("Courier", 9)
+            self._log_card.body, height=6, state="disabled",
+            font=self.font_mono, bd=0, relief="flat", highlightthickness=1,
         )
         self.log_text.pack(fill="both", expand=True)
 
-        # Bottom buttons
-        btn_frame = ttk.Frame(self)
-        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
+    def _load_logo(self, height):
+        """Load the header logo, scaled to `height` px, or None if unavailable.
 
-        ttk.Button(btn_frame, text="Test All", command=self._test_all).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="Clear Log", command=self._clear_log).pack(side="left", padx=5)
+        Reads assets/adi_logo.png (white artwork on transparency, generated
+        from the official blue-on-white lockup). With Pillow the image is
+        resized smoothly and an opaque black backdrop is converted to
+        transparency; without it, Tk's integer-only subsample is used.
+        """
+        here = os.path.dirname(os.path.abspath(__file__))
+        for fname in ("adi_logo.png",):
+            path = os.path.join(here, "assets", fname)
+            if not os.path.exists(path):
+                continue
+            try:
+                from PIL import Image, ImageTk
+            except ImportError:
+                try:
+                    img = tk.PhotoImage(file=path)
+                except tk.TclError:
+                    continue
+                if img.height() > height:        # integer downscale only
+                    img = img.subsample(max(1, round(img.height() / height)))
+                return img
+            try:
+                im = Image.open(path).convert("RGBA")
+                if im.getextrema()[3][0] == 255:          # fully opaque
+                    lum = im.convert("L")
+                    if sum(lum.crop((0, 0, 1, 1)).getdata()) < 32:   # black corner
+                        im = Image.merge("RGBA", (*Image.new("RGB", im.size,
+                                                             (255, 255, 255)).split(),
+                                                  lum))
+                bbox = im.split()[3].getbbox()
+                if bbox:
+                    im = im.crop(bbox)                    # trim padding
+                w = max(1, round(im.width * height / im.height))
+                return ImageTk.PhotoImage(im.resize((w, height), Image.LANCZOS))
+            except Exception:
+                continue
+        return None
 
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+    def _build_header(self):
+        head = tk.Frame(self, height=XXL + MD)
+        head.pack(side="top", fill="x")
+        head.pack_propagate(False)
 
+        left = tk.Frame(head)
+        left.pack(side="left", padx=XL)
+
+        # Analog Devices logo. Drop a file at assets/adi_logo.png (ideally white
+        # artwork on a transparent background) and it appears here automatically;
+        # otherwise the triangle mark, then a glyph, are used as fallbacks.
+        self._logo_img = self._load_logo(LOGO_HEIGHT)
+        if self._logo_img is not None:
+            logo = tk.Label(left, image=self._logo_img, bd=0)
+        else:
+            logo = tk.Label(left, text="◆", font=("", 16))   # last-resort glyph
+        logo.pack(side="left", padx=(0, MD))
+        name = tk.Label(left, text="ADI DataX™ - AI-driven 10BASE-T1L Deployment",
+                        font=self.font_h1)
+        name.pack(side="left")
+
+        right = tk.Frame(head)
+        right.pack(side="right", padx=XL)
+
+        self._btn_theme = Button(right, self, "Dark theme", self._on_toggle_theme,
+                                 variant="secondary", icon="◐", height=30)
+        self._btn_theme.pack(side="left")
+
+        self._header_widgets = (head, left, right)
+        self._header_labels = (logo, name)
+
+    def _build_statusbar(self):
+        bar = tk.Frame(self, height=XL)
+        bar.pack(side="bottom", fill="x")
+        bar.pack_propagate(False)
+
+        self._status_dot = tk.Label(bar, text="●", font=self.font_small)
+        self._status_dot.pack(side="left", padx=(XL, XS))
+        # Colour is paired with wording so the dot is never the sole indicator.
+        self._status_txt = tk.Label(bar, text="Status: Ready", font=self.font_small)
+        self._status_txt.pack(side="left")
+        mode = "Demo mode — synthetic data" if args.demo else "Live hardware"
+        self._mode_txt = tk.Label(bar, text=mode, font=self.font_small)
+        self._mode_txt.pack(side="left", padx=XL)
+        self._refresh_txt = tk.Label(bar, text="Last Refresh: --", font=self.font_mono)
+        self._refresh_txt.pack(side="right", padx=XL)
+        self._statusbar = bar
+
+    # ----------------------------------------------------------------- theming
+    def _on_toggle_theme(self):
+        self.toggle_theme()
+        self._log_message("UI", f"Switched to {self.theme_name} theme")
+
+    def apply_theme(self):
+        t = self.theme
+        self.configure(bg=t["bg"])
+        self._btn_theme.label = ("Dark theme" if self.theme_name == "light"
+                                else "Light theme")
+        self._btn_theme.icon = "◐" if self.theme_name == "light" else "◑"
+        self._apply_ttk_styles()
+
+        for w in self._header_widgets:
+            w.configure(bg=t["header_bg"])
+        for w in self._header_labels:
+            # The logo label holds an image, so only its bg matters; fg would
+            # be a no-op there but is what tints the wordmark text.
+            w.configure(bg=t["header_bg"])
+            if not w.cget("image"):
+                w.configure(fg=t["header_fg"])
+        for w in getattr(self, "_frames", []):
+            w.configure(bg=t["bg"] if w not in (self._log_card.body,) else t["card"])
+        self._log_title.configure(bg=t["card"], fg=t["text"])
+        self.log_text.configure(bg=t["surface"], fg=t["text"],
+                                insertbackground=t["text"],
+                                highlightbackground=t["border"],
+                                highlightcolor=t["border"],
+                                selectbackground=t["primary"],
+                                selectforeground=t["on_primary"])
+        self._statusbar.configure(bg=t["surface"])
+        self._status_dot.configure(bg=t["surface"], fg=SUCCESS[500])
+        for w in (self._status_txt, self._mode_txt):
+            w.configure(bg=t["surface"], fg=t["text2"])
+        self._refresh_txt.configure(bg=t["surface"], fg=t["text_dis"])
+
+        # ScrolledText embeds a classic tk.Scrollbar in its own frame.
+        for w in (self.log_text.master, *self.log_text.master.winfo_children()):
+            if isinstance(w, tk.Scrollbar):
+                w.configure(bg=t["surface"], troughcolor=t["bg"],
+                            activebackground=t["primary"], bd=0,
+                            highlightthickness=0)
+            elif isinstance(w, tk.Frame):
+                w.configure(bg=t["card"])
+
+        # Run every panel/Button/Card hook, then flush so ttk repaints at once.
+        super().apply_theme()
+
+        # Buttons paint their canvas with the *parent's* bg, and hooks run in
+        # construction order — a Button registered before its parent frame was
+        # themed would keep the stale bg. Re-render them once the tree is done.
+        self._rerender_buttons(self)
+        self.update_idletasks()
+
+    def _rerender_buttons(self, widget):
+        for child in widget.winfo_children():
+            if isinstance(child, Button):
+                child.render()
+            else:
+                self._rerender_buttons(child)
+
+    def _apply_ttk_styles(self):
+        """ttk widgets ignore bg=/fg=, so they are driven by named styles."""
+        t, s = self.theme, self.style
+        # Secondary buttons need a visible surface, so they sit on "surface"
+        # with a border rather than blending into the card behind them.
+        s.configure("DS.TButton", background=t["surface"], foreground=t["text"],
+                    bordercolor=t["border"], lightcolor=t["border"],
+                    darkcolor=t["border"], focuscolor=t["primary"],
+                    relief="solid", borderwidth=1,
+                    padding=(SM, XS), font=self.font_ui, anchor="center")
+        s.map("DS.TButton",
+              background=[("pressed", t["primary"]), ("active", t["row_hover"]),
+                          ("disabled", t["surface"])],
+              foreground=[("pressed", t["on_primary"]),
+                          ("disabled", t["text_dis"])],
+              bordercolor=[("focus", t["primary"]), ("active", t["primary"])])
+        for cls in ("DS.TCheckbutton", "DS.TRadiobutton"):
+            s.configure(cls, background=t["card"], foreground=t["text2"],
+                        indicatorcolor=t["surface"], bordercolor=t["border"],
+                        focuscolor=t["primary"], font=self.font_ui)
+            s.map(cls,
+                  background=[("active", t["card"])],
+                  foreground=[("active", t["text"])],
+                  indicatorcolor=[("selected", t["primary"])])
+        s.configure("DS.TEntry", fieldbackground=t["surface"],
+                    foreground=t["text"], bordercolor=t["border"],
+                    lightcolor=t["border"], darkcolor=t["border"],
+                    insertcolor=t["text"], padding=XS)
+        s.configure("DS.TFrame", background=t["card"])
+        s.configure("DS.Vertical.TScrollbar", background=t["surface"],
+                    troughcolor=t["bg"], bordercolor=t["border"],
+                    arrowcolor=t["text2"])
+
+    # -------------------------------------------------------------- log/status
     def _log_message(self, board_name, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
         entry = f"[{timestamp}] {board_name}: {message}\n"
@@ -1299,6 +2184,7 @@ class ControlPanel(tk.Tk):
         self.log_text.insert("end", entry)
         self.log_text.see("end")
         self.log_text.config(state="disabled")
+        self._refresh_txt.config(text=f"Last Refresh: {timestamp}")
 
     def _test_all(self):
         self.board1._test_connection()
